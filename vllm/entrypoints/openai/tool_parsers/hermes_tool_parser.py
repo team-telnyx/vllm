@@ -124,21 +124,6 @@ class Hermes2ProToolParser(ToolParser):
         request: ChatCompletionRequest,
     ) -> Union[DeltaMessage, None]:
 
-        #print(f"\nPREVIOUS_TEXT: {previous_text}")
-        #print(f"\nCURRENT_TEXT: {current_text}")
-        #print(f"\nDELTA_TEXT: {delta_text}")
-        #print(f"\nPREVIOUS_IDS: {previous_token_ids}")
-        #print(f"\nCURRENT_IDS: {current_token_ids}")
-        #print(f"\nDELTA_IDS: {delta_token_ids}")
-        #print("\n\n")
-        #print(f"SELF.TOOL_CALL_START_TOKEN: {self.tool_call_start_token}")
-        #print(f"SELF.TOOL_CALL_END_TOKEN: {self.tool_call_end_token}")
-        #print(f"SELF.TOOL_CALL_START_TOKEN_ID: {self.tool_call_start_token_id}")
-        #print(f"SELF.TOOL_CALL_END_TOKEN_ID: {self.tool_call_end_token_id}")
-
-        #if '{"deck_count": 1' in previous_text:
-        #    breakpoint()
-
         logger.debug("delta_text: %s", delta_text)
         logger.debug("delta_token_ids: %s", delta_token_ids)
         # check to see if we should be streaming a tool call - is there a
@@ -391,4 +376,3 @@ class Hermes2ProToolParser(ToolParser):
 
         except Exception:
             logger.exception("Error trying to handle streaming tool call.")
-            return None  # do not stream a delta. skip this token ID
