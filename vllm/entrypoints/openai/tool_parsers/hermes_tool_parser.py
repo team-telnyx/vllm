@@ -319,9 +319,14 @@ class Hermes2ProToolParser(ToolParser):
                              cur_arguments_json)
 
                 # get the location where previous args differ from current
-                if (delta_text not in cur_arguments_json[:-2]):
-                    return None
-                args_delta_start_loc = cur_arguments_json[:-2]. \
+                if cur_arguments_json.endswith('"}'):
+                    cur_arguments_json_trimmed = cur_arguments_json[:-2]
+                    if delta_text not in cur_arguments_json_trimmed:
+                        return None
+                else:
+                    cur_arguments_json_trimmed = cur_arguments_json
+
+                args_delta_start_loc = cur_arguments_json_trimmed. \
                                            rindex(delta_text) + \
                                            len(delta_text)
 
@@ -341,6 +346,10 @@ class Hermes2ProToolParser(ToolParser):
 
             # last case -- we have an update to existing arguments.
             elif cur_arguments and prev_arguments:
+                # make sure delta includes the rest of the unstreamed parts so far
+                if isinstance(delta_text, str):
+                    delta_text = current_text[current_text.find(self.streamed_args_for_tool[self.current_tool_id])+len(self.streamed_args_for_tool[self.current_tool_id]):current_text.rfind(delta_text)+len(delta_text)]
+
                 if isinstance(delta_text, str) and len(delta_text.rstrip(
                 )) >= 1 and delta_text.rstrip()[-1] == '}':
                     delta_text = delta_text.rstrip()[:-1]
