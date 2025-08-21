@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-
 import ast
 import json
 from collections.abc import Sequence
@@ -26,13 +25,11 @@ class _UnexpectedAstError(Exception):
     pass
 
 
-@ToolParserManager.register_module("pythonic")
-class PythonicToolParser(ToolParser):
+@ToolParserManager.register_module("llama4_pythonic")
+class Llama4PythonicToolParser(ToolParser):
     """
-    Tool call parser for models that produce tool calls in a pythonic style,
-    such as Llama 3.2 and Llama 4 models.
-
-    Used when --enable-auto-tool-choice --tool-call-parser pythonic are all set
+    Toolcall parser for Llama4 that produce tool calls in a pythonic style
+    Use --enable-auto-tool-choice --tool-call-parser llama4_pythonic
     """
     # TODO(mdepinet): Possible future improvements:
     #   1. Support text + tools separated by either <|python_tag|> or \n\n
@@ -46,6 +43,8 @@ class PythonicToolParser(ToolParser):
         re.DOTALL)
 
     def __init__(self, tokenizer: PreTrainedTokenizerBase):
+        self.pythonic_to_tool_name = {}
+        self.pythonic_to_tool_name_dict_created = False
         super().__init__(tokenizer)
 
     # Rename for readability. This is NOT a tool id.
@@ -56,6 +55,11 @@ class PythonicToolParser(ToolParser):
     @current_tool_index.setter
     def current_tool_index(self, value: int) -> None:
         self.current_tool_id = value
+    
+
+    def create_pythonic_tool_name_dict(self, request: ChatCompletionRequest):
+        self.pythonic_to_tool_name = {replace_non_letters(tool_param.function.name): tool_param.function.name for tool_param in request.tools}
+
 
     def extract_tool_calls(
             self, model_output: str,
@@ -63,6 +67,13 @@ class PythonicToolParser(ToolParser):
         """
         Extract the tool calls from a complete model response.
         """
+
+        # remove <|python_start|> and <|python_end|>
+        # as Llama 4 model sometime will output those tokens
+        if model_output.startswith("<|python_start|>"):
+            model_output = model_output[len("<|python_start|>"):]
+            model_output = model_output.replace("<|python_end|>", "")
+
         is_tool_call_pattern = False
         try:
             is_tool_call_pattern = self.TOOL_CALL_REGEX.match(
@@ -87,7 +98,7 @@ class PythonicToolParser(ToolParser):
                 return ExtractedToolCallInformation(
                     tools_called=True,
                     tool_calls=[
-                        _handle_single_tool(e)  # type: ignore
+                        _handle_single_tool(e, self.pythonic_to_tool_name)  # type: ignore
                         for e in parsed.elts
                     ],
                     content=None)
@@ -112,14 +123,40 @@ class PythonicToolParser(ToolParser):
         request: ChatCompletionRequest,
     ) -> Union[DeltaMessage, None]:
 
-        if not current_text.startswith("["):
+        if not self.pythonic_to_tool_name_dict_created:
+            self.create_pythonic_tool_name_dict(request)
+
+        tool_start_index = current_text.find('\n\n[')
+
+        if tool_start_index < 0:
+            tool_start_index = -2
+
+        current_text = current_text[tool_start_index + 2:]
+
+        tool_start_index = previous_text.find('\n\n[')
+
+        if tool_start_index < 0:
+            tool_start_index = -2
+
+        previous_text = previous_text[tool_start_index + 2:]
+
+        if not current_text.startswith("[") and not current_text.startswith(
+                "<|python_start|>"):
             return DeltaMessage(content=delta_text)
 
         try:
+            # remove <|python_start|> and <|python_end|>
+            if current_text.startswith("<|python_start|>"):
+                current_text = current_text[len("<|python_start|>"):]
+            if current_text.endswith("<|python_end|>"):
+                current_text = current_text[:current_text.
+                                            rfind("<|python_end|>")]
             valid_and_added_text = _make_valid_python(current_text)
             if valid_and_added_text is None:
                 return None
             valid_text, added_text = valid_and_added_text
+
+            valid_text = sanitize_function_names(valid_text)
 
             module = ast.parse(valid_text)
             parsed = getattr(module.body[0], "value", None)
@@ -128,7 +165,7 @@ class PythonicToolParser(ToolParser):
                 raise _UnexpectedAstError(
                     "Tool output must be a list of function calls")
             tool_calls = [
-                _handle_single_tool(e)  # type: ignore
+                _handle_single_tool(e, self.pythonic_to_tool_name)  # type: ignore
                 for e in parsed.elts
             ]
 
@@ -164,11 +201,11 @@ class PythonicToolParser(ToolParser):
                         self.streamed_args_for_tool[
                             index] += delta.function.arguments
 
-            # HACK: serving_chat.py inspects the internal state of tool parsers
-            # when determining it's final streaming delta, automatically
-            # adding autocompleted JSON.
-            # These two lines avoid that nonsense while ensuring finish_reason
-            # is set to tool_calls when at least one tool is called.
+        # HACK: serving_chat.py inspects the internal state of tool parsers
+        # when determining it's final streaming delta, automatically
+        # adding autocompleted JSON.
+        # These two lines avoid that nonsense while ensuring finish_reason
+        # is set to tool_calls when at least one tool is called.
             if tool_deltas and not self.prev_tool_call_arr:
                 self.prev_tool_call_arr = [{"arguments": {}}]
 
@@ -177,6 +214,7 @@ class PythonicToolParser(ToolParser):
             elif not added_text and self.current_tool_id > 0:
                 # Return an empty DeltaMessage once the tool calls are all done
                 # so that finish_reason gets set.
+
                 return DeltaMessage(content='')
             else:
                 return None
@@ -205,19 +243,17 @@ def _get_parameter_value(val: ast.expr) -> Any:
         raise _UnexpectedAstError("Tool call arguments must be literals")
 
 
-def _handle_single_tool(call: ast.Call) -> ToolCall:
+def _handle_single_tool(call: ast.Call, pythonic_to_tool_name: dict) -> ToolCall:
     if not isinstance(call.func, ast.Name):
         raise _UnexpectedAstError("Invalid tool call name")
     function_name = call.func.id
+    function_name = pythonic_to_tool_name[function_name]
     arguments = {}
     for keyword in call.keywords:
         arguments[keyword.arg] = _get_parameter_value(keyword.value)
-    return ToolCall(
-        type="function",
-        function=FunctionCall(name=function_name,
-                              arguments=json.dumps(arguments,
-                                                   ensure_ascii=False)),
-    )
+    return ToolCall(type="function",
+                    function=FunctionCall(name=function_name,
+                                          arguments=json.dumps(arguments)))
 
 
 def _make_valid_python(text: str) -> Union[tuple[str, str], None]:
@@ -306,3 +342,28 @@ def _compute_tool_delta(previously_sent_args: str, new_call: ToolCall,
     return DeltaToolCall(
         id=None, index=index, function=DeltaFunctionCall(
             arguments=arg_diff)) if arg_diff else None
+
+
+def replace_non_letters(text): 
+    return re.sub(r'[^a-zA-Z0-9]', '_', text)
+
+
+def sanitize_function_names(text):
+    """
+    Replace non-alphanumeric characters in function names with underscores.
+    Function calls are in format: [func1(...)] or [func1(...), func2(...)]
+    """
+    # A possible TODO: handle for function argument names as well
+    
+    def replace_invalid_chars(match):
+        func_name = match.group(1)
+        # Replace any non-letter, non-number character with underscore
+        sanitized = replace_non_letters(func_name) 
+        return f"{match.group(0)[0]}{sanitized}("
+    
+    # Pattern: after [ or comma+optional space, capture function name before (
+    pattern = r'([\[,]\s*)([^(]+)\('
+    
+    result = re.sub(pattern, lambda m: m.group(1) + re.sub(r'[^a-zA-Z0-9]', '_', m.group(2)) + '(', text)
+    return result
+
