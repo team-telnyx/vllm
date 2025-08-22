@@ -43,6 +43,8 @@ class Llama4PythonicToolParser(ToolParser):
         re.DOTALL)
 
     def __init__(self, tokenizer: PreTrainedTokenizerBase):
+        self.pythonic_to_tool_name = {}
+        self.pythonic_to_tool_name_dict_created = False
         super().__init__(tokenizer)
 
     # Rename for readability. This is NOT a tool id.
@@ -53,6 +55,11 @@ class Llama4PythonicToolParser(ToolParser):
     @current_tool_index.setter
     def current_tool_index(self, value: int) -> None:
         self.current_tool_id = value
+    
+
+    def create_pythonic_tool_name_dict(self, request: ChatCompletionRequest):
+        self.pythonic_to_tool_name = {replace_non_letters(tool_param.function.name): tool_param.function.name for tool_param in request.tools}
+
 
     def extract_tool_calls(
             self, model_output: str,
@@ -91,7 +98,7 @@ class Llama4PythonicToolParser(ToolParser):
                 return ExtractedToolCallInformation(
                     tools_called=True,
                     tool_calls=[
-                        _handle_single_tool(e)  # type: ignore
+                        _handle_single_tool(e, self.pythonic_to_tool_name)  # type: ignore
                         for e in parsed.elts
                     ],
                     content=None)
@@ -116,6 +123,31 @@ class Llama4PythonicToolParser(ToolParser):
         request: ChatCompletionRequest,
     ) -> Union[DeltaMessage, None]:
 
+        #current_text = '[create-appointment(appt={"'
+        if not self.pythonic_to_tool_name_dict_created:
+            self.create_pythonic_tool_name_dict(request)
+
+        #breakpoint()
+        print(f"\nCURRENT TEXT: {repr(current_text)}\n")
+        
+        tool_start_index = current_text.find('\n\n[')
+
+        print(f"TOOL START INDEX : {tool_start_index}")
+
+        if tool_start_index < 0:
+            tool_start_index = -2
+
+        current_text = current_text[tool_start_index + 2:]
+
+        tool_start_index = previous_text.find('\n\n[')
+
+        if tool_start_index < 0:
+            tool_start_index = -2
+
+        previous_text = previous_text[tool_start_index + 2:]
+
+        print(f"\nCURRENT TEXT AFTER CUT: {repr(current_text)}\n")
+        
         if not current_text.startswith("[") and not current_text.startswith(
                 "<|python_start|>"):
             return DeltaMessage(content=delta_text)
@@ -129,8 +161,12 @@ class Llama4PythonicToolParser(ToolParser):
                                             rfind("<|python_end|>")]
             valid_and_added_text = _make_valid_python(current_text)
             if valid_and_added_text is None:
+                print("132 returned none")
                 return None
             valid_text, added_text = valid_and_added_text
+
+            #breakpoint()
+            valid_text = sanitize_function_names(valid_text)
 
             module = ast.parse(valid_text)
             parsed = getattr(module.body[0], "value", None)
@@ -139,7 +175,7 @@ class Llama4PythonicToolParser(ToolParser):
                 raise _UnexpectedAstError(
                     "Tool output must be a list of function calls")
             tool_calls = [
-                _handle_single_tool(e)  # type: ignore
+                _handle_single_tool(e, self.pythonic_to_tool_name)  # type: ignore
                 for e in parsed.elts
             ]
 
@@ -170,6 +206,7 @@ class Llama4PythonicToolParser(ToolParser):
 
                 if delta is not None:
                     tool_deltas.append(delta)
+                    print(f"Tool deltas became: {tool_deltas}")
                     if (delta.function is not None
                             and delta.function.arguments is not None):
                         self.streamed_args_for_tool[
@@ -188,14 +225,19 @@ class Llama4PythonicToolParser(ToolParser):
             elif not added_text and self.current_tool_id > 0:
                 # Return an empty DeltaMessage once the tool calls are all done
                 # so that finish_reason gets set.
+
+                # TODO return tool_done as well with the 
+                print('TOOL CALLS ARE DONE.')
                 return DeltaMessage(content='')
             else:
+                print("196 returned none")
                 return None
         except Exception:
             logger.exception("Error trying to handle streaming tool call.")
             logger.debug(
                 "Skipping chunk as a result of tool streaming extraction "
                 "error")
+            print("203 returned none")
             return None
 
 
@@ -216,10 +258,12 @@ def _get_parameter_value(val: ast.expr) -> Any:
         raise _UnexpectedAstError("Tool call arguments must be literals")
 
 
-def _handle_single_tool(call: ast.Call) -> ToolCall:
+def _handle_single_tool(call: ast.Call, pythonic_to_tool_name: dict) -> ToolCall:
     if not isinstance(call.func, ast.Name):
         raise _UnexpectedAstError("Invalid tool call name")
     function_name = call.func.id
+    #breakpoint()
+    function_name = pythonic_to_tool_name[function_name]
     arguments = {}
     for keyword in call.keywords:
         arguments[keyword.arg] = _get_parameter_value(keyword.value)
@@ -314,3 +358,28 @@ def _compute_tool_delta(previously_sent_args: str, new_call: ToolCall,
     return DeltaToolCall(
         id=None, index=index, function=DeltaFunctionCall(
             arguments=arg_diff)) if arg_diff else None
+
+def replace_non_letters(text): 
+    return re.sub(r'[^a-zA-Z0-9]', '_', text)
+
+def fix_boolean_case(text): 
+    """Convert lowercase true/false to True/False"""
+    return re.sub(r'\b(true|false)\b', lambda m: m.group(1).capitalize(), text)
+
+def sanitize_function_names(text):
+    """
+    Replace non-alphanumeric characters in function names with underscores.
+    Function calls are in format: [func1(...)] or [func1(...), func2(...)]
+    """
+    # A possible TODO: handle for function argument names as well
+    
+    # Pattern: after [ or comma+optional space, capture function name before (
+    pattern = r'([\[,]\s*)([^(]+)\('
+    
+    # Step 1: Fix function names
+    result = re.sub(pattern, lambda m: m.group(1) + replace_non_letters(m.group(2)) + '(', text)
+    
+    # Step 2: Fix boolean values
+    result = fix_boolean_case(result)
+    
+    return result
