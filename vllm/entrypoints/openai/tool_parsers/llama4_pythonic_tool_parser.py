@@ -128,11 +128,11 @@ class Llama4PythonicToolParser(ToolParser):
             self.create_pythonic_tool_name_dict(request)
 
         #breakpoint()
-        print(f"\nCURRENT TEXT: {repr(current_text)}\n")
+        #print(f"\nCURRENT TEXT: {repr(current_text)}\n")
         
         tool_start_index = current_text.find('\n\n[')
 
-        print(f"TOOL START INDEX : {tool_start_index}")
+        #print(f"TOOL START INDEX : {tool_start_index}")
 
         if tool_start_index < 0:
             tool_start_index = -2
@@ -146,7 +146,7 @@ class Llama4PythonicToolParser(ToolParser):
 
         previous_text = previous_text[tool_start_index + 2:]
 
-        print(f"\nCURRENT TEXT AFTER CUT: {repr(current_text)}\n")
+        #print(f"\nCURRENT TEXT AFTER CUT: {repr(current_text)}\n")
         
         if not current_text.startswith("[") and not current_text.startswith(
                 "<|python_start|>"):
@@ -161,7 +161,7 @@ class Llama4PythonicToolParser(ToolParser):
                                             rfind("<|python_end|>")]
             valid_and_added_text = _make_valid_python(current_text)
             if valid_and_added_text is None:
-                print("132 returned none")
+                #print("132 returned none")
                 return None
             valid_text, added_text = valid_and_added_text
 
@@ -206,7 +206,7 @@ class Llama4PythonicToolParser(ToolParser):
 
                 if delta is not None:
                     tool_deltas.append(delta)
-                    print(f"Tool deltas became: {tool_deltas}")
+                    #print(f"Tool deltas became: {tool_deltas}")
                     if (delta.function is not None
                             and delta.function.arguments is not None):
                         self.streamed_args_for_tool[
@@ -227,7 +227,7 @@ class Llama4PythonicToolParser(ToolParser):
                 # so that finish_reason gets set.
 
                 # TODO return tool_done as well with the 
-                print('TOOL CALLS ARE DONE.')
+                #print('TOOL CALLS ARE DONE.')
                 return DeltaMessage(content='')
             else:
                 print("196 returned none")
@@ -237,7 +237,7 @@ class Llama4PythonicToolParser(ToolParser):
             logger.debug(
                 "Skipping chunk as a result of tool streaming extraction "
                 "error")
-            print("203 returned none")
+            #print("203 returned none")
             return None
 
 
