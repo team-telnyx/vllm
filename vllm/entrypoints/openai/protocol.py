@@ -745,8 +745,8 @@ class ChatCompletionRequest(OpenAIBaseModel):
                     s_tag_obj = structural_tag.model_dump(by_alias=True)
                     self.structured_outputs.structural_tag = json.dumps(
                         s_tag_obj)
-		elif response_format.type == "text":
-		    self.structured_outputs = None
+                elif response_format.type == "text":
+                    self.structured_outputs = None
 
             # Set structured output params for tool calling
             if json_schema_from_tool is not None:
