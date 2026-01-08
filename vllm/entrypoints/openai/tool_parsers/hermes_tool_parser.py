@@ -417,7 +417,7 @@ class Hermes2ProToolParser(ToolParser):
                 if isinstance(delta_text, str):
                     # Cut out the first function name portion (to prevent issues with args named 'name')
                     function_name_ending = current_text.find(',') + 1
-                    currrent_text_args = current_text[function_name_ending:].strip()
+                    currrent_text_args = current_text[function_name_ending:]
                     delta_text = currrent_text_args[currrent_text_args.find(self.streamed_args_for_tool[self.current_tool_id])+len(self.streamed_args_for_tool[self.current_tool_id]):currrent_text_args.rfind(delta_text)+len(delta_text)]
                 # judge whether the tool_call_portion is a complete JSON
                 try:
