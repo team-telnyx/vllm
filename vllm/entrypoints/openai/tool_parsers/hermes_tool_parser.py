@@ -413,12 +413,6 @@ class Hermes2ProToolParser(ToolParser):
 
             # last case -- we have an update to existing arguments.
             elif cur_arguments and prev_arguments:
-                # make sure delta includes the rest of the unstreamed parts so far
-                if isinstance(delta_text, str):
-                    # Cut out the first function name portion (to prevent issues with args named 'name')
-                    function_name_ending = current_text.find(',') + 1
-                    currrent_text_args = current_text[function_name_ending:].lstrip()
-                    delta_text = currrent_text_args[currrent_text_args.find(self.streamed_args_for_tool[self.current_tool_id])+len(self.streamed_args_for_tool[self.current_tool_id]):currrent_text_args.rfind(delta_text)+len(delta_text)]
                 # judge whether the tool_call_portion is a complete JSON
                 try:
                     json.loads(tool_call_portion)
@@ -433,7 +427,6 @@ class Hermes2ProToolParser(ToolParser):
                     and len(delta_text.rstrip()) >= 1 \
                     and delta_text.rstrip()[-1] == '}' \
                     and is_complete_json:
-
                     delta_text = delta_text.rstrip()[:-1]
 
                 logger.debug("got diff %s", delta_text)
