@@ -3,6 +3,7 @@
 
 import json
 from collections.abc import Sequence
+from typing import Union
 
 import partial_json_parser
 import regex as re
@@ -20,12 +21,12 @@ from vllm.entrypoints.openai.engine.protocol import (
     FunctionCall,
     ToolCall,
 )
-from vllm.logger import init_logger
-from vllm.tokenizers import TokenizerLike
-from vllm.tokenizers.mistral import MistralTokenizer
 from vllm.tool_parsers.abstract_tool_parser import (
     ToolParser,
 )
+from vllm.logger import init_logger
+from vllm.tokenizers import TokenizerLike
+from vllm.tokenizers.mistral import MistralTokenizer
 
 logger = init_logger(__name__)
 
@@ -34,9 +35,9 @@ class Hermes2ProToolParser(ToolParser):
     def __init__(self, tokenizer: TokenizerLike):
         super().__init__(tokenizer)
 
-        if isinstance(tokenizer, MistralTokenizer):
+        if isinstance(self.model_tokenizer, MistralTokenizer):
             logger.error("Detected Mistral tokenizer when using a Hermes model")
-            self.model_tokenizer = tokenizer.tokenizer
+            self.model_tokenizer = self.model_tokenizer.tokenizer
 
         self.current_tool_name_sent: bool = False
         self.prev_tool_call_arr: list[dict] = []
@@ -113,7 +114,6 @@ class Hermes2ProToolParser(ToolParser):
                 return delta_text
 
     def adjust_request(self, request: ChatCompletionRequest) -> ChatCompletionRequest:
-        request = super().adjust_request(request)
         if request.tools and request.tool_choice != "none":
             # do not skip special tokens because the tool_call tokens are
             # marked "special" in some models. Since they are skipped
@@ -182,7 +182,7 @@ class Hermes2ProToolParser(ToolParser):
         current_token_ids: Sequence[int],
         delta_token_ids: Sequence[int],
         request: ChatCompletionRequest,
-    ) -> DeltaMessage | None:
+    ) -> Union[DeltaMessage, None]:
         # 1. All tokens are parsed based on _text, not token_ids.
         # 2. All incoming text data is processed by the tool_call_delta_buffer
         #    function for buffering before being used for parsing.
@@ -334,7 +334,7 @@ class Hermes2ProToolParser(ToolParser):
             if not self.current_tool_name_sent:
                 if current_tool_call is None:
                     return None
-                function_name: str | None = current_tool_call.get("name")
+                function_name: Union[str, None] = current_tool_call.get("name")
                 if function_name:
                     self.current_tool_name_sent = True
                     return DeltaMessage(
@@ -451,6 +451,19 @@ class Hermes2ProToolParser(ToolParser):
 
             # last case -- we have an update to existing arguments.
             elif cur_arguments and prev_arguments:
+                # make sure delta includes the rest of the unstreamed parts so far
+                if isinstance(delta_text, str):
+                    # Cut out the first function name portion (to prevent issues with args named 'name')
+                    function_name_ending = current_text.find(",") + 1
+                    currrent_text_args = current_text[function_name_ending:].lstrip()
+                    delta_text = currrent_text_args[
+                        currrent_text_args.find(
+                            self.streamed_args_for_tool[self.current_tool_id]
+                        )
+                        + len(
+                            self.streamed_args_for_tool[self.current_tool_id]
+                        ) : currrent_text_args.rfind(delta_text) + len(delta_text)
+                    ]
                 # judge whether the tool_call_portion is a complete JSON
                 try:
                     json.loads(tool_call_portion)
