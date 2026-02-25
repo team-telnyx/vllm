@@ -51,6 +51,8 @@ class Llama4PythonicToolParser(ToolParser):
     )
 
     def __init__(self, tokenizer: PreTrainedTokenizerBase):
+        self.pythonic_to_tool_name: dict[str, str] = {}
+        self.pythonic_to_tool_name_dict_created = False
         super().__init__(tokenizer)
 
     # Rename for readability. This is NOT a tool id.
@@ -61,6 +63,12 @@ class Llama4PythonicToolParser(ToolParser):
     @current_tool_index.setter
     def current_tool_index(self, value: int) -> None:
         self.current_tool_id = value
+
+    def create_pythonic_tool_name_dict(self, request: ChatCompletionRequest):
+        self.pythonic_to_tool_name = {
+            replace_non_letters(tool_param.function.name): tool_param.function.name
+            for tool_param in request.tools
+        }
 
     def extract_tool_calls(
         self, model_output: str, request: ChatCompletionRequest
@@ -103,7 +111,7 @@ class Llama4PythonicToolParser(ToolParser):
                 return ExtractedToolCallInformation(
                     tools_called=True,
                     tool_calls=[
-                        _handle_single_tool(e)  # type: ignore
+                        _handle_single_tool(e, self.pythonic_to_tool_name)  # type: ignore
                         for e in parsed.elts
                     ],
                     content=None,
@@ -129,6 +137,20 @@ class Llama4PythonicToolParser(ToolParser):
         delta_token_ids: Sequence[int],
         request: ChatCompletionRequest,
     ) -> DeltaMessage | None:
+        if not self.pythonic_to_tool_name_dict_created:
+            self.create_pythonic_tool_name_dict(request)
+            self.pythonic_to_tool_name_dict_created = True
+
+        tool_start_index = current_text.find("\n\n[")
+        if tool_start_index < 0:
+            tool_start_index = -2
+        current_text = current_text[tool_start_index + 2:]
+
+        tool_start_index = previous_text.find("\n\n[")
+        if tool_start_index < 0:
+            tool_start_index = -2
+        previous_text = previous_text[tool_start_index + 2:]
+
         if not current_text.startswith("[") and not current_text.startswith(
             "<|python_start|>"
         ):
@@ -145,6 +167,8 @@ class Llama4PythonicToolParser(ToolParser):
                 return None
             valid_text, added_text = valid_and_added_text
 
+            valid_text = sanitize_function_names(valid_text)
+
             module = ast.parse(valid_text)
             parsed = getattr(module.body[0], "value", None)
             if not isinstance(parsed, ast.List) or not all(
@@ -154,7 +178,7 @@ class Llama4PythonicToolParser(ToolParser):
                     "Tool output must be a list of function calls"
                 )
             tool_calls = [
-                _handle_single_tool(e)  # type: ignore
+                _handle_single_tool(e, self.pythonic_to_tool_name)  # type: ignore
                 for e in parsed.elts
             ]
 
@@ -232,10 +256,11 @@ def _get_parameter_value(val: ast.expr) -> Any:
         raise _UnexpectedAstError("Tool call arguments must be literals")
 
 
-def _handle_single_tool(call: ast.Call) -> ToolCall:
+def _handle_single_tool(call: ast.Call, pythonic_to_tool_name: dict) -> ToolCall:
     if not isinstance(call.func, ast.Name):
         raise _UnexpectedAstError("Invalid tool call name")
     function_name = call.func.id
+    function_name = pythonic_to_tool_name.get(function_name, function_name)
     arguments = {}
     for keyword in call.keywords:
         arguments[keyword.arg] = _get_parameter_value(keyword.value)
@@ -341,3 +366,21 @@ def _compute_tool_delta(
         if arg_diff
         else None
     )
+
+
+
+def replace_non_letters(text):
+    return re.sub(r"[^a-zA-Z0-9]", "_", text)
+
+
+def fix_boolean_case(text):
+    return re.sub(r"\b(true|false)\b", lambda m: m.group(1).capitalize(), text)
+
+
+def sanitize_function_names(text):
+    pattern = r"([\[,]\s*)([^(]+)\("
+    result = re.sub(
+        pattern, lambda m: m.group(1) + replace_non_letters(m.group(2)) + "(", text
+    )
+    result = fix_boolean_case(result)
+    return result
