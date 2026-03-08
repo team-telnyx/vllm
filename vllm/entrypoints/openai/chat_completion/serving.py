@@ -72,7 +72,6 @@ from vllm.logger import init_logger
 from vllm.logprobs import Logprob
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.parser import ParserManager
-from vllm.reasoning import ReasoningParser
 from vllm.sampling_params import BeamSearchParams, SamplingParams
 from vllm.tokenizers import TokenizerLike
 from vllm.tool_parsers import ToolParser
@@ -125,7 +124,7 @@ class OpenAIServingChat(OpenAIServing):
         self.enable_log_deltas = enable_log_deltas
 
         # set up reasoning parser
-        self.reasoning_parser_cls = ParserManager.get_reasoning_parser(
+        self.reasoning_parser = ParserManager.get_reasoning_parser(
             reasoning_parser_name=reasoning_parser
         )
         # set up tool use
@@ -325,24 +324,6 @@ class OpenAIServingChat(OpenAIServing):
         for the API specification. This API mimics the OpenAI
         Chat Completion API.
         """
-        # Streaming response
-        tokenizer = self.renderer.tokenizer
-        assert tokenizer is not None
-        reasoning_parser: ReasoningParser | None = None
-        try:
-            if self.reasoning_parser_cls:
-                # Pass the same chat template kwargs as used in tokenization
-                chat_template_kwargs = self._prepare_extra_chat_template_kwargs(
-                    request.chat_template_kwargs,
-                    self.default_chat_template_kwargs,
-                )
-                reasoning_parser = self.reasoning_parser_cls(
-                    tokenizer,
-                    chat_template_kwargs=chat_template_kwargs,  # type: ignore[call-arg]
-                )
-        except RuntimeError as e:
-            logger.exception("Error in reasoning parser creation.")
-            return self.create_error_response(str(e))
         result = await self.render_chat_request(request)
         if isinstance(result, ErrorResponse):
             return result
@@ -452,6 +433,10 @@ class OpenAIServingChat(OpenAIServing):
         assert len(generators) == 1
         (result_generator,) = generators
 
+        # Streaming response
+        tokenizer = self.renderer.tokenizer
+        assert tokenizer is not None
+
         if request.stream:
             return self.chat_completion_stream_generator(
                 request,
@@ -461,7 +446,6 @@ class OpenAIServingChat(OpenAIServing):
                 conversation,
                 tokenizer,
                 request_metadata,
-                reasoning_parser,
             )
 
         try:
@@ -473,7 +457,6 @@ class OpenAIServingChat(OpenAIServing):
                 conversation,
                 tokenizer,
                 request_metadata,
-                reasoning_parser,
             )
         except GenerationError as e:
             return self._convert_generation_error_to_response(e)
@@ -633,7 +616,6 @@ class OpenAIServingChat(OpenAIServing):
         conversation: list[ConversationMessage],
         tokenizer: TokenizerLike,
         request_metadata: RequestResponseMetadata,
-        reasoning_parser: ReasoningParser | None = None,
     ) -> AsyncGenerator[str, None]:
         created_time = int(time.time())
         chunk_object_type: Final = "chat.completion.chunk"
@@ -664,6 +646,8 @@ class OpenAIServingChat(OpenAIServing):
         )
 
         all_previous_token_ids: list[list[int]] | None
+        accumulated_reasoning_arr: list[str] | None
+        seen_content_arr: list[bool] | None
         function_name_returned = [False] * num_choices
         if self.tool_call_id_type == "kimi_k2":
             history_tool_call_cnt = get_history_tool_calls_cnt(conversation)
@@ -675,16 +659,44 @@ class OpenAIServingChat(OpenAIServing):
 
         # Only one of these will be used, thus previous_texts and
         # all_previous_token_ids will not be used twice in the same iteration.
-        if tool_choice_auto or reasoning_parser:
+        if tool_choice_auto or self.reasoning_parser:
             # These are only required in "auto" tool choice case
             all_previous_token_ids = [[]] * num_choices
             # For reasoning parser and tool call all enabled
             added_content_delta_arr = [False] * num_choices
             reasoning_end_arr = [False] * num_choices
             prompt_is_reasoning_end_arr: list[bool | None] = [None] * num_choices
+            accumulated_reasoning_arr = [""] * num_choices
+            seen_content_arr = [False] * num_choices
         else:
             all_previous_token_ids = None
+            accumulated_reasoning_arr = None
+            seen_content_arr = None
 
+        reasoning_parser = None
+
+        try:
+            if self.reasoning_parser:
+                if tokenizer is None:
+                    raise ValueError(
+                        "Tokenizer not available when `skip_tokenizer_init=True`"
+                    )
+
+                # Pass the same chat template kwargs as used in tokenization
+                chat_template_kwargs = self._prepare_extra_chat_template_kwargs(
+                    request.chat_template_kwargs,
+                    self.default_chat_template_kwargs,
+                )
+                reasoning_parser = self.reasoning_parser(
+                    tokenizer,
+                    chat_template_kwargs=chat_template_kwargs or {},  # type: ignore[call-arg]
+                )
+        except RuntimeError as e:
+            logger.exception("Error in reasoning parser creation.")
+            data = self.create_streaming_error_response(str(e))
+            yield f"data: {data}\n\n"
+            yield "data: [DONE]\n\n"
+            return
         # Prepare the tool parser if it's needed
         try:
             if tool_choice_auto and self.tool_parser:
@@ -806,7 +818,7 @@ class OpenAIServingChat(OpenAIServing):
                     tool_parser = tool_parsers[i]
 
                     if (
-                        reasoning_parser
+                        self.reasoning_parser
                         and res.prompt_token_ids
                         and prompt_is_reasoning_end_arr[i] is None
                     ):
@@ -868,7 +880,7 @@ class OpenAIServingChat(OpenAIServing):
                     delta_message: DeltaMessage | None
 
                     # just update previous_texts and previous_token_ids
-                    if tool_choice_auto or reasoning_parser:
+                    if tool_choice_auto or self.reasoning_parser:
                         assert previous_texts is not None
                         assert all_previous_token_ids is not None
                         previous_text = previous_texts[i]
@@ -906,7 +918,7 @@ class OpenAIServingChat(OpenAIServing):
                             reasoning_end_arr[i] = True
 
                         if (
-                            reasoning_parser
+                            self.reasoning_parser
                             and not reasoning_end_arr[i]
                             and not reasoning_parser.is_reasoning_end(
                                 previous_token_ids
@@ -938,7 +950,7 @@ class OpenAIServingChat(OpenAIServing):
                                     current_text = ""
                         else:
                             # Just to add remaining `content`
-                            if reasoning_parser:
+                            if self.reasoning_parser:
                                 delta_text = previous_text + delta_text
                                 current_text = ""
 
@@ -984,13 +996,13 @@ class OpenAIServingChat(OpenAIServing):
                         output_token_ids = as_list(output.token_ids)
 
                         if (
-                            reasoning_parser is not None
+                            self.reasoning_parser is not None
                             and not reasoning_end_arr[i]
                             and prompt_is_reasoning_end_arr[i]
                         ):
                             reasoning_end_arr[i] = True
 
-                        if reasoning_parser and not reasoning_end_arr[i]:
+                        if self.reasoning_parser and not reasoning_end_arr[i]:
                             delta_message = (
                                 reasoning_parser.extract_reasoning_streaming(
                                     previous_text,
@@ -1033,8 +1045,9 @@ class OpenAIServingChat(OpenAIServing):
 
                     # handle streaming deltas for tools with "auto" tool choice
                     # and reasoning parser
-                    elif tool_choice_auto and reasoning_parser:
+                    elif tool_choice_auto and self.reasoning_parser:
                         assert tool_parser is not None
+                        assert reasoning_parser is not None
                         assert added_content_delta_arr is not None
                         assert reasoning_end_arr is not None
                         output_token_ids = as_list(output.token_ids)
@@ -1115,30 +1128,50 @@ class OpenAIServingChat(OpenAIServing):
                             tools_streamed[i] = True
 
                     # when only reasoning
-                    elif reasoning_parser:
-                        # When encountering think end id in prompt_token_ids
-                        # i.e {"enable_thinking": False},
-                        # set reasoning status to end.
-                        # Route all generated tokens as content directly.
-                        if prompt_is_reasoning_end_arr[i]:
-                            delta_message = DeltaMessage(content=delta_text)
-                        else:
-                            delta_message = (
-                                reasoning_parser.extract_reasoning_streaming(
-                                    previous_text,
-                                    current_text,
-                                    delta_text,
-                                    previous_token_ids,
-                                    current_token_ids,
-                                    output.token_ids,
-                                )
-                            )
+                    elif self.reasoning_parser:
+                        delta_message = reasoning_parser.extract_reasoning_streaming(
+                            previous_text,
+                            current_text,
+                            delta_text,
+                            previous_token_ids,
+                            current_token_ids,
+                            output.token_ids,
+                        )
+
+                        # Check if reasoning has ended (e.g., </think> token seen)
+                        # This handles the case where the end token is a single
+                        # token and extract_reasoning_streaming returns None
+                        if not reasoning_end_arr[
+                            i
+                        ] and reasoning_parser.is_reasoning_end(
+                            as_list(output.token_ids)
+                        ):
+                            reasoning_end_arr[i] = True
+                            # If content was extracted, mark it as seen
+                            if delta_message and delta_message.content:
+                                seen_content_arr[i] = True
+
+                        # After reasoning ends, subsequent deltas should be
+                        # content, not reasoning. Convert reasoning delta to
+                        # content delta since we're past </think>
+                        if (
+                            reasoning_end_arr[i]
+                            and delta_message
+                            and delta_message.reasoning
+                            and not delta_message.content
+                        ):
+                            delta_message.content = delta_message.reasoning
+                            delta_message.reasoning = None
+                            if seen_content_arr is not None:
+                                seen_content_arr[i] = True
                     # handle streaming just a content delta
                     else:
                         delta_message = DeltaMessage(content=delta_text)
 
                     # update the previous values for the next iteration
-                    if (tool_choice_auto or reasoning_parser) and not self.use_harmony:
+                    if (
+                        tool_choice_auto or self.reasoning_parser
+                    ) and not self.use_harmony:
                         assert previous_texts is not None
                         assert all_previous_token_ids is not None
                         previous_texts[i] = current_text
@@ -1166,6 +1199,15 @@ class OpenAIServingChat(OpenAIServing):
                             continue
                         delta_message = DeltaMessage()
 
+                    # Track reasoning and content for fallback copy
+                    if self.reasoning_parser and delta_message is not None:
+                        if (
+                            accumulated_reasoning_arr is not None
+                            and delta_message.reasoning
+                        ):
+                            accumulated_reasoning_arr[i] += delta_message.reasoning
+                        if seen_content_arr is not None and delta_message.content:
+                            seen_content_arr[i] = True
                     # Log streaming delta if output logging is enabled
                     if self.enable_log_outputs and self.request_logger:
                         delta_content_parts = []
@@ -1270,6 +1312,26 @@ class OpenAIServingChat(OpenAIServing):
                                 delta_message, remaining_call, index
                             )
 
+                        # If no content was ever sent, no tools were called,
+                        # and we have accumulated reasoning, set content to
+                        # reasoning for the final chunk. This handles the case
+                        # where the model generates reasoning without a closing
+                        # </think> tag, putting all output in reasoning.
+                        if (
+                            self.reasoning_parser
+                            and accumulated_reasoning_arr is not None
+                            and seen_content_arr is not None
+                            and not seen_content_arr[i]
+                            and not tools_streamed[i]
+                            and not (self.use_harmony and harmony_tools_streamed[i])
+                            and not auto_tools_called
+                            and accumulated_reasoning_arr[i]
+                        ):
+                            # Copy accumulated reasoning to content
+                            if delta_message is None:
+                                delta_message = DeltaMessage()
+                            delta_message.content = accumulated_reasoning_arr[i]
+                            seen_content_arr[i] = True  # Prevent re-emission
                         # Send the finish response for each request.n only once
                         # In OpenAI's API, when a tool is called, the
                         # finish_reason is:
@@ -1392,7 +1454,6 @@ class OpenAIServingChat(OpenAIServing):
         conversation: list[ConversationMessage],
         tokenizer: TokenizerLike,
         request_metadata: RequestResponseMetadata,
-        reasoning_parser: ReasoningParser | None = None,
     ) -> ErrorResponse | ChatCompletionResponse:
         from vllm.tokenizers.mistral import MistralTokenizer
 
@@ -1487,7 +1548,25 @@ class OpenAIServingChat(OpenAIServing):
                 choices.append(choice_data)
                 continue
 
-            if reasoning_parser:
+            if self.reasoning_parser:
+                try:
+                    if tokenizer is None:
+                        raise ValueError(
+                            "Tokenizer not available when `skip_tokenizer_init=True`"
+                        )
+
+                    # Pass the same chat template kwargs as used in tokenization
+                    chat_template_kwargs = self._prepare_extra_chat_template_kwargs(
+                        request.chat_template_kwargs,
+                        self.default_chat_template_kwargs,
+                    )
+                    reasoning_parser = self.reasoning_parser(
+                        tokenizer,
+                        chat_template_kwargs=chat_template_kwargs,  # type: ignore[call-arg]
+                    )
+                except RuntimeError as e:
+                    logger.exception("Error in reasoning parser creation.")
+                    return self.create_error_response(str(e))
                 # If the reasoning parser is enabled,
                 # tool calls are extracted exclusively from the content.
                 reasoning, content = reasoning_parser.extract_reasoning(
@@ -1509,6 +1588,18 @@ class OpenAIServingChat(OpenAIServing):
                 enable_auto_tools=self.enable_auto_tools,
                 tool_parser_cls=self.tool_parser,
             )
+            # Copy reasoning to content if:
+            # - content is None or empty
+            # - reasoning has actual content
+            # - no tool calls were detected
+            # This handles the case where the model generates reasoning
+            # without a closing </think> tag, putting all output in reasoning.
+            if (
+                not content  # content is None or empty string
+                and reasoning  # reasoning has actual content
+                and not tool_calls  # no tool calls
+            ):
+                content = reasoning
             tool_call_class = (
                 MistralToolCall if is_mistral_tokenizer(tokenizer) else ToolCall
             )
