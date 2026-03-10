@@ -1,0 +1,118 @@
+# Minimal Dockerfile for installing vLLM from a pre-built wheel.
+# No source build pipeline — single runtime stage only.
+
+# =============================================================================
+# VERSION / CONFIG ARGS
+# =============================================================================
+ARG CUDA_VERSION=12.9.1
+ARG PYTHON_VERSION=3.12
+
+# CUDA runtime base (GPU drivers + minimal libs)
+ARG BASE_IMAGE=nvidia/cuda:${CUDA_VERSION}-base-ubuntu22.04
+
+# PyTorch wheel index
+ARG PYTORCH_CUDA_INDEX_BASE_URL=https://download.pytorch.org/whl
+
+# vLLM commit wheel source
+ARG VLLM_COMMIT=f1c664545b954e30ac4887e32ce8f73b39310a9a
+
+# =============================================================================
+# SINGLE RUNTIME STAGE
+# =============================================================================
+FROM ${BASE_IMAGE} AS vllm-prebuilt
+
+ARG CUDA_VERSION
+ARG PYTHON_VERSION
+ARG PYTORCH_CUDA_INDEX_BASE_URL
+ARG VLLM_COMMIT
+ARG FLASHINFER_VERSION=0.6.4
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# ---- System packages: Python, pip, C compiler, curl ---------------------
+RUN apt-get update -y \
+    && apt-get install -y --no-install-recommends \
+        software-properties-common \
+        curl \
+        git \
+        gcc \
+        g++ \
+        libibverbs-dev \
+    && add-apt-repository -y ppa:deadsnakes/ppa \
+    && apt-get update -y \
+    && apt-get install -y --no-install-recommends \
+        python${PYTHON_VERSION} \
+        python${PYTHON_VERSION}-dev \
+        python${PYTHON_VERSION}-venv \
+    && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python${PYTHON_VERSION} 1 \
+    && update-alternatives --set python3 /usr/bin/python${PYTHON_VERSION} \
+    && curl -sS https://bootstrap.pypa.io/get-pip.py | python${PYTHON_VERSION} \
+    && python3 --version && python3 -m pip --version \
+    && rm -rf /var/lib/apt/lists/*
+
+# ---- Install CUDA development tools for runtime JIT compilation ----------
+RUN CUDA_VERSION_DASH=$(echo $CUDA_VERSION | cut -d. -f1,2 | tr '.' '-') && \
+    apt-get update -y && \
+    apt-get install -y --no-install-recommends \
+        cuda-nvcc-${CUDA_VERSION_DASH} \
+        cuda-cudart-${CUDA_VERSION_DASH} \
+        cuda-nvrtc-${CUDA_VERSION_DASH} \
+        cuda-cuobjdump-${CUDA_VERSION_DASH} \
+        libcurand-dev-${CUDA_VERSION_DASH} \
+        libcublas-${CUDA_VERSION_DASH} \
+        libnccl-dev && \
+    rm -rf /var/lib/apt/lists/*
+
+# ---- Set host C compiler for torch Inductor / Triton runtime JIT --------
+ENV CC=/usr/bin/gcc
+
+# ---- Install uv (fast pip alternative) ----------------------------------
+RUN python3 -m pip install uv
+
+# ---- uv environment settings --------------------------------------------
+ENV UV_HTTP_TIMEOUT=500
+ENV UV_INDEX_STRATEGY="first-index"
+ENV UV_LINK_MODE=copy
+
+# ---- CUDA compatibility library -----------------------------------------
+RUN echo "/usr/local/cuda-$(echo "$CUDA_VERSION" | cut -d. -f1,2)/compat/" \
+        > /etc/ld.so.conf.d/cuda-compat.conf && ldconfig
+
+# ---- Derive CUDA_VERSION_SHORT (e.g. 12.9.1 -> 129) ----------------------
+# ---- Resolve wheel URL and install vLLM from commit wheel ---------------
+RUN set -eux; \
+    CUDA_VERSION_SHORT="cu$(echo "$CUDA_VERSION" | cut -d. -f1,2 | tr -d '.')"; \
+    echo "CUDA_VERSION_SHORT=${CUDA_VERSION_SHORT}"; \
+    WHEEL_INDEX_URL="https://wheels.vllm.ai/${VLLM_COMMIT}/${CUDA_VERSION_SHORT}/vllm/"; \
+    echo "Fetching wheel listing from ${WHEEL_INDEX_URL}"; \
+    VLLM_WHEEL_HREF=$(curl -sSL "${WHEEL_INDEX_URL}" \
+        | grep -oP 'href="[^"]*x86_64\.whl"' \
+        | head -1 \
+        | sed 's/href="\(.*\)"/\1/'); \
+    if [ -z "${VLLM_WHEEL_HREF}" ]; then \
+        echo "ERROR: Could not resolve vLLM wheel href from ${WHEEL_INDEX_URL}" >&2; \
+        exit 1; \
+    fi; \
+    VLLM_WHEEL_URL="https://wheels.vllm.ai/${VLLM_COMMIT}/$(basename ${VLLM_WHEEL_HREF})"; \
+    echo "Resolved VLLM_WHEEL_URL=${VLLM_WHEEL_URL}"; \
+    uv pip install --system --reinstall \
+        --index-strategy unsafe-best-match \
+        "${VLLM_WHEEL_URL}" \
+        --extra-index-url "${PYTORCH_CUDA_INDEX_BASE_URL}/${CUDA_VERSION_SHORT}" \
+        --extra-index-url https://pypi.org/simple
+
+# ---- Install FlashInfer prebuilt binaries and JIT cache ------------------
+RUN set -eux; \
+    CUDA_VERSION_SHORT="cu$(echo "$CUDA_VERSION" | cut -d. -f1,2 | tr -d '.')"; \
+    uv pip install --system flashinfer-cubin==${FLASHINFER_VERSION}; \
+    uv pip install --system flashinfer-jit-cache==${FLASHINFER_VERSION} \
+      --extra-index-url "https://flashinfer.ai/whl/${CUDA_VERSION_SHORT}"; \
+    flashinfer show-config
+
+# ---- Ensure torch shared libs are on the runtime linker path ------------
+RUN TORCH_LIB=$(python3 -c "import pathlib, torch; print(pathlib.Path(torch.__file__).parent / 'lib')") \
+    && echo "${TORCH_LIB}" > /etc/ld.so.conf.d/torch.conf \
+    && ldconfig
+
+# ---- Default CMD: verify import + print version -------------------------
+CMD ["python3", "-c", "import vllm, vllm._C; print(vllm.__version__)"]
