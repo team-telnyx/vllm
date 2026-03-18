@@ -180,6 +180,7 @@ if TYPE_CHECKING:
     VLLM_MAX_TOKENS_PER_EXPERT_FP4_MOE: int = 163840
     VLLM_TOOL_PARSE_REGEX_TIMEOUT_SECONDS: int = 1
     VLLM_SLEEP_WHEN_IDLE: bool = False
+    VLLM_KIMI_TOOL_PARSER_MAX_SECTION_CHARS: int = 524288
     VLLM_MQ_MAX_CHUNK_BYTES_MB: int = 16
     VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: int = 300
     VLLM_KV_CACHE_LAYOUT: Literal["NHD", "HND"] | None = None
@@ -1341,6 +1342,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Reduce CPU usage when vLLM is idle. Enabling this will incur small
     # latency penalty when a request eventually comes.
     "VLLM_SLEEP_WHEN_IDLE": lambda: bool(int(os.getenv("VLLM_SLEEP_WHEN_IDLE", "0"))),
+    # Maximum characters allowed in a Kimi K2 tool section before forcing
+    # exit. Default 512KB (524288 chars). Set higher for very large tool
+    # call arguments (e.g., code generation).
+    "VLLM_KIMI_TOOL_PARSER_MAX_SECTION_CHARS": lambda: int(
+        os.getenv("VLLM_KIMI_TOOL_PARSER_MAX_SECTION_CHARS", "524288")
+    ),
     # Control the max chunk bytes (in MB) for the rpc message queue.
     # Object larger than this threshold will be broadcast to worker
     # processes via zmq.
