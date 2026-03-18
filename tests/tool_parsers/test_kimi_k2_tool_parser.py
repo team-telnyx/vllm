@@ -502,11 +502,7 @@ def test_empty_tool_section(kimi_k2_tool_parser):
     assert kimi_k2_tool_parser.in_tool_section is False
 
 
-def test_malformed_tool_section_recovery(kimi_k2_tool_parser):
-    """
-    Test that the parser recovers from a malformed tool section
-    that never closes properly.
-    """
+def test_large_tool_args_no_forced_exit(kimi_k2_tool_parser):
     kimi_k2_tool_parser.reset_streaming_state()
 
     section_begin_id = kimi_k2_tool_parser.vocab.get("<|tool_calls_section_begin|>")
@@ -523,9 +519,40 @@ def test_malformed_tool_section_recovery(kimi_k2_tool_parser):
     )
     assert kimi_k2_tool_parser.in_tool_section is True
 
-    # Simulate a lot of text without proper tool calls or section end
-    # This should trigger the error recovery mechanism
-    large_text = "x" * 10000  # Exceeds max_section_chars
+    large_text = "x" * 10000
+
+    _result2 = kimi_k2_tool_parser.extract_tool_calls_streaming(
+        previous_text="<|tool_calls_section_begin|>",
+        current_text="<|tool_calls_section_begin|>" + large_text,
+        delta_text=large_text,
+        previous_token_ids=[section_begin_id],
+        current_token_ids=[section_begin_id] + list(range(100, 100 + len(large_text))),
+        delta_token_ids=list(range(100, 100 + len(large_text))),
+        request=None,
+    )
+
+    assert kimi_k2_tool_parser.in_tool_section is True
+
+
+def test_malformed_tool_section_safety_valve(kimi_k2_tool_parser):
+    kimi_k2_tool_parser.reset_streaming_state()
+    original_max = kimi_k2_tool_parser.max_section_chars
+    kimi_k2_tool_parser.max_section_chars = 5000
+
+    section_begin_id = kimi_k2_tool_parser.vocab.get("<|tool_calls_section_begin|>")
+
+    _result1 = kimi_k2_tool_parser.extract_tool_calls_streaming(
+        previous_text="",
+        current_text="<|tool_calls_section_begin|>",
+        delta_text="<|tool_calls_section_begin|>",
+        previous_token_ids=[],
+        current_token_ids=[section_begin_id],
+        delta_token_ids=[section_begin_id],
+        request=None,
+    )
+    assert kimi_k2_tool_parser.in_tool_section is True
+
+    large_text = "x" * 10000
 
     result2 = kimi_k2_tool_parser.extract_tool_calls_streaming(
         previous_text="<|tool_calls_section_begin|>",
@@ -537,11 +564,11 @@ def test_malformed_tool_section_recovery(kimi_k2_tool_parser):
         request=None,
     )
 
-    # Parser should have force-exited the tool section
     assert kimi_k2_tool_parser.in_tool_section is False
-    # And returned the content as reasoning
     assert result2 is not None
     assert result2.content == large_text
+
+    kimi_k2_tool_parser.max_section_chars = original_max
 
 
 def test_state_reset(kimi_k2_tool_parser):
@@ -552,6 +579,7 @@ def test_state_reset(kimi_k2_tool_parser):
     kimi_k2_tool_parser.current_tool_id = 5
     kimi_k2_tool_parser.prev_tool_call_arr = [{"id": "test"}]
     kimi_k2_tool_parser.section_char_count = 1000
+    kimi_k2_tool_parser._current_tool_args = '{"key": "value"}'
 
     # Reset
     kimi_k2_tool_parser.reset_streaming_state()
@@ -564,6 +592,7 @@ def test_state_reset(kimi_k2_tool_parser):
     assert kimi_k2_tool_parser.section_char_count == 0
     assert kimi_k2_tool_parser.current_tool_name_sent is False
     assert kimi_k2_tool_parser.streamed_args_for_tool == []
+    assert kimi_k2_tool_parser._current_tool_args == ""
 
 
 def test_section_begin_noise_tool_begin_same_chunk(kimi_k2_tool_parser):
@@ -923,3 +952,106 @@ def test_streaming_multiple_tool_calls_not_leaked(kimi_k2_tool_parser):
 
     # Legitimate content preserved
     assert "compare" in full_content.lower() or len(all_content) > 0
+
+
+def test_complete_tool_call_single_delta(kimi_k2_tool_parser):
+    kimi_k2_tool_parser.reset_streaming_state()
+
+    section_begin_id = kimi_k2_tool_parser.vocab.get("<|tool_calls_section_begin|>")
+    tool_begin_id = kimi_k2_tool_parser.vocab.get("<|tool_call_begin|>")
+    tool_end_id = kimi_k2_tool_parser.vocab.get("<|tool_call_end|>")
+
+    run_streaming_sequence(
+        kimi_k2_tool_parser,
+        [("<|tool_calls_section_begin|>", [section_begin_id])],
+    )
+
+    complete_tool = (
+        "<|tool_call_begin|>functions.get_weather:0 "
+        '<|tool_call_argument_begin|> {"city": "Paris"} '
+        "<|tool_call_end|>"
+    )
+
+    result = kimi_k2_tool_parser.extract_tool_calls_streaming(
+        previous_text="<|tool_calls_section_begin|>",
+        current_text="<|tool_calls_section_begin|>" + complete_tool,
+        delta_text=complete_tool,
+        previous_token_ids=[section_begin_id],
+        current_token_ids=[section_begin_id, tool_begin_id, 10, 11, 12, tool_end_id],
+        delta_token_ids=[tool_begin_id, 10, 11, 12, tool_end_id],
+        request=None,
+    )
+
+    assert result is not None
+    assert result.tool_calls is not None and len(result.tool_calls) > 0
+
+    first_tc = result.tool_calls[0]
+    assert first_tc.function is not None
+    func = first_tc.function
+    if isinstance(func, dict):
+        has_name = func.get("name") is not None
+    else:
+        has_name = getattr(func, "name", None) is not None
+    assert has_name
+
+
+def test_tool_name_split_across_deltas(kimi_k2_tool_parser):
+    kimi_k2_tool_parser.reset_streaming_state()
+
+    section_begin_id = kimi_k2_tool_parser.vocab.get("<|tool_calls_section_begin|>")
+    tool_begin_id = kimi_k2_tool_parser.vocab.get("<|tool_call_begin|>")
+
+    deltas = [
+        ("<|tool_calls_section_begin|>", [section_begin_id]),
+        ("<|tool_call_begin|>functions.get_", [tool_begin_id, 10]),
+        ("weather:0 <|tool_call_argument_begin|> ", [11, 12]),
+    ]
+
+    results = run_streaming_sequence(kimi_k2_tool_parser, deltas)
+
+    assert results[1] is None
+    assert results[2] is not None
+    assert results[2].tool_calls is not None and len(results[2].tool_calls) == 1
+    assert results[2].tool_calls[0].function is not None
+    assert results[2].tool_calls[0].function.name == "get_weather"
+
+
+def test_tool_arguments_stream_across_multiple_deltas(kimi_k2_tool_parser):
+    kimi_k2_tool_parser.reset_streaming_state()
+
+    section_begin_id = kimi_k2_tool_parser.vocab.get("<|tool_calls_section_begin|>")
+    tool_begin_id = kimi_k2_tool_parser.vocab.get("<|tool_call_begin|>")
+    tool_end_id = kimi_k2_tool_parser.vocab.get("<|tool_call_end|>")
+
+    deltas = [
+        ("<|tool_calls_section_begin|>", [section_begin_id]),
+        (
+            "<|tool_call_begin|>functions.get_weather:0 <|tool_call_argument_begin|> ",
+            [tool_begin_id, 10],
+        ),
+        ('{"city":', [11]),
+        (' "Paris"', [12]),
+        ('}<|tool_call_end|>', [13, tool_end_id]),
+    ]
+
+    results = run_streaming_sequence(kimi_k2_tool_parser, deltas)
+
+    assert results[1] is not None
+    assert results[1].tool_calls is not None
+    assert results[1].tool_calls[0].function is not None
+    assert results[1].tool_calls[0].function.name == "get_weather"
+
+    assert results[2] is not None
+    assert results[2].tool_calls is not None
+    assert results[2].tool_calls[0].function is not None
+    assert results[2].tool_calls[0].function.arguments == '{"city":'
+
+    assert results[3] is not None
+    assert results[3].tool_calls is not None
+    assert results[3].tool_calls[0].function is not None
+    assert results[3].tool_calls[0].function.arguments == ' "Paris"'
+
+    assert results[4] is not None
+    assert results[4].tool_calls is not None
+    assert results[4].tool_calls[0].function is not None
+    assert results[4].tool_calls[0].function.arguments == '}'
