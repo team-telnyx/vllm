@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import functools
+import inspect
 import json
 import logging
 import os
@@ -1693,8 +1694,7 @@ def disable_envs_cache() -> None:
     global __getattr__
     # If __getattr__ is wrapped by functions.cache, unwrap the caching layer.
     if _is_envs_cache_enabled():
-        assert hasattr(__getattr__, "__wrapped__")
-        __getattr__ = __getattr__.__wrapped__
+        __getattr__ = inspect.unwrap(__getattr__)
 
 
 def __dir__():
