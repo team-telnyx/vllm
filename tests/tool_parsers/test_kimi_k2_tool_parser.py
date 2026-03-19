@@ -525,7 +525,7 @@ def test_malformed_tool_section_recovery(kimi_k2_tool_parser):
 
     # Simulate a lot of text without proper tool calls or section end
     # This should trigger the error recovery mechanism
-    large_text = "x" * 10000  # Exceeds max_section_chars
+    large_text = "x" * (kimi_k2_tool_parser.max_section_chars + 1)
 
     result2 = kimi_k2_tool_parser.extract_tool_calls_streaming(
         previous_text="<|tool_calls_section_begin|>",
@@ -923,3 +923,43 @@ def test_streaming_multiple_tool_calls_not_leaked(kimi_k2_tool_parser):
 
     # Legitimate content preserved
     assert "compare" in full_content.lower() or len(all_content) > 0
+
+
+def test_same_chunk_full_call_populates_serving_state(kimi_k2_tool_parser):
+    kimi_k2_tool_parser.reset_streaming_state()
+
+    section_begin_id = kimi_k2_tool_parser.vocab.get("<|tool_calls_section_begin|>")
+    section_end_id = kimi_k2_tool_parser.vocab.get("<|tool_calls_section_end|>")
+    tool_begin_id = kimi_k2_tool_parser.vocab.get("<|tool_call_begin|>")
+    tool_end_id = kimi_k2_tool_parser.vocab.get("<|tool_call_end|>")
+
+    tool_delta = (
+        '<|tool_call_begin|>functions.execute_command:0<|tool_call_argument_begin|>{"command":"pwd"}'
+        "<|tool_call_end|><|tool_calls_section_end|>"
+    )
+
+    results = run_streaming_sequence(
+        kimi_k2_tool_parser,
+        [
+            ("<|tool_calls_section_begin|>", [section_begin_id]),
+            (tool_delta, [tool_begin_id, 10, 11, tool_end_id, section_end_id]),
+        ],
+    )
+
+    assert results[1] is not None
+    assert results[1].tool_calls is not None
+    assert len(results[1].tool_calls) == 1
+    assert results[1].tool_calls[0].id == "functions.execute_command:0"
+    assert results[1].tool_calls[0].function is not None
+    assert results[1].tool_calls[0].function.name == "execute_command"
+    assert results[1].tool_calls[0].function.arguments == '{"command":"pwd"}'
+
+    assert kimi_k2_tool_parser.prev_tool_call_arr == [
+        {
+            "id": "functions.execute_command:0",
+            "name": "execute_command",
+            "arguments": '{"command":"pwd"}',
+        }
+    ]
+    assert kimi_k2_tool_parser.streamed_args_for_tool == ['{"command":"pwd"}']
+    assert kimi_k2_tool_parser.in_tool_section is False
