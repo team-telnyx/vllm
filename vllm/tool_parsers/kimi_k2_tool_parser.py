@@ -395,9 +395,7 @@ class KimiK2ToolParser(ToolParser):
                         tool_calls=[
                             DeltaToolCall(
                                 index=self.current_tool_id,
-                                function=DeltaFunctionCall(arguments=diff).model_dump(
-                                    exclude_none=True
-                                ),
+                                function=DeltaFunctionCall(arguments=diff),
                             )
                         ]
                     )
@@ -451,9 +449,7 @@ class KimiK2ToolParser(ToolParser):
                                 index=self.current_tool_id,
                                 type="function",
                                 id=tool_id,
-                                function=DeltaFunctionCall(
-                                    name=function_name
-                                ).model_dump(exclude_none=True),
+                                function=DeltaFunctionCall(name=function_name),
                             )
                         ]
                     )
@@ -497,6 +493,7 @@ class KimiK2ToolParser(ToolParser):
 
             logger.debug("diffing old arguments: %s", prev_arguments)
             logger.debug("against new ones: %s", cur_arguments)
+            delta: DeltaMessage | None = None
 
             # case -- no arguments have been created yet. skip sending a delta.
             if not cur_arguments and not prev_arguments:
@@ -519,9 +516,7 @@ class KimiK2ToolParser(ToolParser):
                     tool_calls=[
                         DeltaToolCall(
                             index=self.current_tool_id,
-                            function=DeltaFunctionCall(
-                                arguments=cur_arguments
-                            ).model_dump(exclude_none=True),
+                            function=DeltaFunctionCall(arguments=cur_arguments),
                         )
                     ]
                 )
@@ -542,9 +537,7 @@ class KimiK2ToolParser(ToolParser):
                         tool_calls=[
                             DeltaToolCall(
                                 index=self.current_tool_id,
-                                function=DeltaFunctionCall(
-                                    arguments=delta_arguments
-                                ).model_dump(exclude_none=True),
+                                function=DeltaFunctionCall(arguments=delta_arguments),
                             )
                         ]
                     )
