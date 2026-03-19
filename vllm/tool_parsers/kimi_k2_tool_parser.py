@@ -267,6 +267,16 @@ class KimiK2ToolParser(ToolParser):
         prev_begin_count = previous_token_ids.count(self.tool_call_start_token_id)
         cur_begin_count = current_token_ids.count(self.tool_call_start_token_id)
         cur_end_count = current_token_ids.count(self.tool_call_end_token_id)
+        complete_calls_in_delta = self._parse_complete_calls(delta_text)
+
+        if len(complete_calls_in_delta) > 1:
+            multi_call_delta = self._emit_complete_calls(
+                complete_calls_in_delta,
+                start_index=prev_begin_count,
+            )
+            if found_end and state.in_tool_section:
+                return self._finish_section(multi_call_delta, delta_text)
+            return multi_call_delta
 
         if cur_begin_count > prev_begin_count:
             self.current_tool_id += 1
@@ -389,6 +399,53 @@ class KimiK2ToolParser(ToolParser):
             "name": self._call_id_to_name(call_id),
             "arguments": None,
         }
+
+    def _parse_complete_calls(self, text: str) -> list[dict[str, str]]:
+        complete_calls: list[dict[str, str]] = []
+        for match in self._RE_FULL.finditer(text):
+            call_id = match.group("call_id")
+            complete_calls.append(
+                {
+                    "id": call_id,
+                    "name": self._call_id_to_name(call_id),
+                    "arguments": match.group("args"),
+                }
+            )
+        return complete_calls
+
+    def _emit_complete_calls(
+        self,
+        complete_calls: list[dict[str, str]],
+        *,
+        start_index: int,
+    ) -> DeltaMessage:
+        tool_calls: list[DeltaToolCall] = []
+        for offset, complete_call in enumerate(complete_calls):
+            index = start_index + offset
+            self._reset_tool_slot(index)
+            self.prev_tool_call_arr[index] = {
+                "id": complete_call["id"],
+                "name": complete_call["name"],
+                "arguments": complete_call["arguments"],
+            }
+            self.streamed_args_for_tool[index] = complete_call["arguments"]
+            tool_calls.append(
+                DeltaToolCall(
+                    index=index,
+                    type="function",
+                    id=complete_call["id"],
+                    function=DeltaFunctionCall(
+                        name=complete_call["name"],
+                        arguments=complete_call["arguments"],
+                    ),
+                )
+            )
+
+        self.current_tool_id = start_index + len(complete_calls) - 1
+        self.current_tool_name_sent = True
+        self._state.current_args = complete_calls[-1]["arguments"]
+
+        return DeltaMessage(tool_calls=tool_calls)
 
     def _sync_current_tool(self, parsed: dict[str, str | None] | None) -> None:
         if parsed is None or self.current_tool_id < 0:

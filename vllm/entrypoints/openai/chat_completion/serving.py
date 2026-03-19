@@ -1910,7 +1910,9 @@ class OpenAIServingChat(OpenAIServing):
             and self.enable_auto_tools
             and self.tool_parser
             and delta_message
+            and delta_message.content is None
             and delta_message.tool_calls
+            and len(delta_message.tool_calls) == 1
             and delta_message.tool_calls[0]
             and delta_message.tool_calls[0].function
             and delta_message.tool_calls[0].function.arguments is not None

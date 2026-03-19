@@ -963,3 +963,94 @@ def test_same_chunk_full_call_populates_serving_state(kimi_k2_tool_parser):
     ]
     assert kimi_k2_tool_parser.streamed_args_for_tool == ['{"command":"pwd"}']
     assert kimi_k2_tool_parser.in_tool_section is False
+
+
+def test_multiple_complete_tool_calls_same_chunk(kimi_k2_tool_parser):
+    kimi_k2_tool_parser.reset_streaming_state()
+
+    section_begin_id = kimi_k2_tool_parser.vocab.get("<|tool_calls_section_begin|>")
+    section_end_id = kimi_k2_tool_parser.vocab.get("<|tool_calls_section_end|>")
+    tool_begin_id = kimi_k2_tool_parser.vocab.get("<|tool_call_begin|>")
+    tool_end_id = kimi_k2_tool_parser.vocab.get("<|tool_call_end|>")
+
+    tool_delta = (
+        '<|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{"city":"Tokyo"}<|tool_call_end|>'
+        '<|tool_call_begin|>functions.get_weather:1<|tool_call_argument_begin|>{"city":"Paris"}<|tool_call_end|>'
+        "<|tool_calls_section_end|>"
+    )
+
+    results = run_streaming_sequence(
+        kimi_k2_tool_parser,
+        [
+            ("<|tool_calls_section_begin|>", [section_begin_id]),
+            (
+                tool_delta,
+                [tool_begin_id, 10, tool_end_id, tool_begin_id, 11, tool_end_id, section_end_id],
+            ),
+        ],
+    )
+
+    assert results[1] is not None
+    assert results[1].tool_calls is not None
+    assert len(results[1].tool_calls) == 2
+
+    first_call = results[1].tool_calls[0]
+    second_call = results[1].tool_calls[1]
+    assert first_call.index == 0
+    assert first_call.id == "functions.get_weather:0"
+    assert first_call.function is not None
+    assert first_call.function.name == "get_weather"
+    assert first_call.function.arguments == '{"city":"Tokyo"}'
+
+    assert second_call.index == 1
+    assert second_call.id == "functions.get_weather:1"
+    assert second_call.function is not None
+    assert second_call.function.name == "get_weather"
+    assert second_call.function.arguments == '{"city":"Paris"}'
+
+    assert kimi_k2_tool_parser.prev_tool_call_arr == [
+        {
+            "id": "functions.get_weather:0",
+            "name": "get_weather",
+            "arguments": '{"city":"Tokyo"}',
+        },
+        {
+            "id": "functions.get_weather:1",
+            "name": "get_weather",
+            "arguments": '{"city":"Paris"}',
+        },
+    ]
+    assert kimi_k2_tool_parser.streamed_args_for_tool == [
+        '{"city":"Tokyo"}',
+        '{"city":"Paris"}',
+    ]
+    assert kimi_k2_tool_parser.current_tool_id == 1
+    assert kimi_k2_tool_parser.in_tool_section is False
+
+
+def test_same_delta_trailing_text_after_section_end(kimi_k2_tool_parser):
+    kimi_k2_tool_parser.reset_streaming_state()
+
+    section_begin_id = kimi_k2_tool_parser.vocab.get("<|tool_calls_section_begin|>")
+    section_end_id = kimi_k2_tool_parser.vocab.get("<|tool_calls_section_end|>")
+    tool_begin_id = kimi_k2_tool_parser.vocab.get("<|tool_call_begin|>")
+    tool_end_id = kimi_k2_tool_parser.vocab.get("<|tool_call_end|>")
+
+    trailing_delta = (
+        '<|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{"city":"Berlin"}<|tool_call_end|>'
+        "<|tool_calls_section_end|> Done"
+    )
+
+    results = run_streaming_sequence(
+        kimi_k2_tool_parser,
+        [
+            ("<|tool_calls_section_begin|>", [section_begin_id]),
+            (trailing_delta, [tool_begin_id, 10, tool_end_id, section_end_id, 20]),
+        ],
+    )
+
+    assert results[1] is not None
+    assert results[1].tool_calls is not None
+    assert len(results[1].tool_calls) == 1
+    assert results[1].content == " Done"
+    assert kimi_k2_tool_parser.in_tool_section is False
