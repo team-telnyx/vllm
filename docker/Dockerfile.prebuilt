@@ -1,0 +1,142 @@
+# Minimal prebuilt Dockerfile for vLLM 0.17.1 (wheel-only install).
+# Single runtime stage — no source builds, no multi-stage pipeline.
+
+# =============================================================================
+# VERSION MANAGEMENT
+# =============================================================================
+ARG CUDA_VERSION=13.0.0
+ARG PYTHON_VERSION=3.12
+
+# PyTorch CUDA wheel index
+ARG PYTORCH_CUDA_INDEX_BASE_URL=https://download.pytorch.org/whl
+
+# FlashInfer version (pinned to match upstream)
+ARG FLASHINFER_VERSION=0.6.4
+
+# =============================================================================
+# SINGLE RUNTIME STAGE
+# =============================================================================
+FROM nvidia/cuda:${CUDA_VERSION}-base-ubuntu22.04
+
+ARG CUDA_VERSION
+ARG PYTHON_VERSION
+ARG PYTORCH_CUDA_INDEX_BASE_URL
+ARG FLASHINFER_VERSION
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+WORKDIR /vllm-workspace
+
+# ---- Python version string for package paths (e.g. "312" for 3.12) ----
+RUN PYTHON_VERSION_STR=$(echo ${PYTHON_VERSION} | sed 's/\.//g') && \
+    echo "export PYTHON_VERSION_STR=${PYTHON_VERSION_STR}" >> /etc/environment
+
+# ---- System packages: Python, pip, host compiler, curl ----
+RUN apt-get update -y \
+    && apt-get install -y --no-install-recommends \
+        software-properties-common \
+        curl \
+        sudo \
+        python3-pip \
+        gcc \
+        g++ \
+    && for i in 1 2 3; do \
+            add-apt-repository -y ppa:deadsnakes/ppa && break || \
+            { echo "Attempt $i failed, retrying in 5s..."; sleep 5; }; \
+        done \
+    && apt-get update -y \
+    && apt-get install -y --no-install-recommends \
+        python${PYTHON_VERSION} \
+        python${PYTHON_VERSION}-dev \
+        python${PYTHON_VERSION}-venv \
+    && rm -rf /var/lib/apt/lists/* \
+    && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python${PYTHON_VERSION} 1 \
+    && update-alternatives --set python3 /usr/bin/python${PYTHON_VERSION} \
+    && ln -sf /usr/bin/python${PYTHON_VERSION}-config /usr/bin/python3-config \
+    && curl -sS https://bootstrap.pypa.io/get-pip.py | python${PYTHON_VERSION} \
+    && python3 --version && python3 -m pip --version
+
+# Host C compiler for torch._inductor / Triton runtime compilation
+ENV CC=/usr/bin/gcc
+
+# ---- CUDA runtime JIT toolchain ----
+# Required for FlashInfer JIT, DeepGEMM JIT, and torch._inductor CUDA paths.
+# Also install CUDA 12.9 cudart for backward compatibility: vLLM's prebuilt
+# _C.abi3.so is compiled against CUDA 12 (needs libcudart.so.12).
+RUN CUDA_VERSION_DASH=$(echo $CUDA_VERSION | cut -d. -f1,2 | tr '.' '-') && \
+    apt-get update -y && \
+    apt-get install -y --no-install-recommends \
+        cuda-nvcc-${CUDA_VERSION_DASH} \
+        cuda-cudart-${CUDA_VERSION_DASH} \
+        cuda-nvrtc-${CUDA_VERSION_DASH} \
+        cuda-cuobjdump-${CUDA_VERSION_DASH} \
+        libcurand-dev-${CUDA_VERSION_DASH} \
+        libcublas-${CUDA_VERSION_DASH} \
+        libnccl-dev \
+        cuda-cudart-12-9 \
+        cuda-cudart-dev-${CUDA_VERSION_DASH} && \
+    rm -rf /var/lib/apt/lists/* && \
+    # Create libcuda.so.1 symlink from stubs for non-GPU build/test environments.
+    # In real GPU deployments, the nvidia-container-runtime provides the real libcuda.so.1.
+    ln -sf /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1
+
+# ---- Install uv (fast pip frontend) ----
+RUN python3 -m pip install uv
+
+# ---- Environment for uv / pip ----
+ENV UV_HTTP_TIMEOUT=500
+ENV UV_INDEX_STRATEGY="unsafe-best-match"
+ENV UV_LINK_MODE=copy
+
+# ---- Derive CUDA_VERSION_SHORT (e.g. "13.0.0" -> "cu130") ----
+# Used for PyTorch and FlashInfer index URLs
+RUN CUDA_VERSION_SHORT=cu$(echo ${CUDA_VERSION} | cut -d. -f1,2 | tr -d '.') && \
+    echo "export CUDA_VERSION_SHORT=${CUDA_VERSION_SHORT}" >> /etc/environment && \
+    echo "CUDA_VERSION_SHORT=${CUDA_VERSION_SHORT}"
+
+# ---- Install vLLM 0.17.1 (wheel-only, no sdist/source fallback) ----
+RUN . /etc/environment && \
+    uv pip install --system --only-binary=:all: \
+        vllm==0.17.1 \
+        --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/${CUDA_VERSION_SHORT} \
+        --extra-index-url https://pypi.org/simple
+
+# ---- Install FlashInfer runtime assets ----
+RUN . /etc/environment && \
+    uv pip install --system flashinfer-cubin==${FLASHINFER_VERSION} && \
+    uv pip install --system flashinfer-jit-cache==${FLASHINFER_VERSION} \
+        --extra-index-url https://flashinfer.ai/whl/${CUDA_VERSION_SHORT}
+
+# ---- Ensure torch + nvidia pip-package shared libs are on the runtime linker path ----
+# The nvidia-* pip wheels install .so files under site-packages/nvidia/*/lib/.
+# torch installs libtorch*.so under site-packages/torch/lib/.
+# CUDA 12 compat libs are at /usr/local/cuda-12.9/lib64/.
+# All must be discoverable by the dynamic linker for `import vllm._C` to work.
+RUN SITE=$(python3 -c "import sysconfig; print(sysconfig.get_path('purelib'))") && \
+    TORCH_LIB="${SITE}/torch/lib" && \
+    echo "${TORCH_LIB}" > /etc/ld.so.conf.d/torch.conf && \
+    find "${SITE}/nvidia" -name '*.so*' -printf '%h\n' 2>/dev/null | sort -u | \
+        while read d; do echo "$d"; done > /etc/ld.so.conf.d/nvidia-pip.conf && \
+    echo "/usr/local/cuda-12.9/lib64" >> /etc/ld.so.conf.d/nvidia-pip.conf && \
+    echo "/usr/local/cuda/lib64/stubs" >> /etc/ld.so.conf.d/nvidia-pip.conf && \
+    ldconfig && \
+    # Verify critical libs are now resolvable
+    echo "=== ldconfig: libcudart check ===" && \
+    ldconfig -p | grep libcudart
+
+# CUDA forward compatibility
+ENV VLLM_ENABLE_CUDA_COMPATIBILITY=0
+
+# LD_LIBRARY_PATH: nvidia compat + CUDA system + CUDA 12 compat + torch + all nvidia pip packages
+# Since Dockerfile ENV can't be set dynamically from RUN output, we use an entrypoint wrapper.
+RUN SITE=$(python3 -c "import sysconfig; print(sysconfig.get_path('purelib'))") && \
+    TORCH_LIB="${SITE}/torch/lib" && \
+    NV_DIRS=$(find "${SITE}/nvidia" -name '*.so*' -printf '%h\n' 2>/dev/null | sort -u | tr '\n' ':') && \
+    printf '#!/bin/sh\nexport LD_LIBRARY_PATH="/usr/local/nvidia/lib64:/usr/local/cuda/lib64:/usr/local/cuda-12.9/lib64:/usr/local/cuda/lib64/stubs:%s:%s${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"\nexec "$@"\n' \
+        "${TORCH_LIB}" "${NV_DIRS}" > /usr/local/bin/entrypoint.sh && \
+    chmod +x /usr/local/bin/entrypoint.sh
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+
+# ---- Default CMD: verify vLLM imports and print version ----
+CMD ["python3", "-c", "import vllm; print(f'vLLM {vllm.__version__} ready')"]
