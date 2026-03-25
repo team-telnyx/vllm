@@ -335,6 +335,8 @@ class Hermes2ProToolParser(ToolParser):
             # case - we haven't sent the tool name yet. If it's available, send
             #   it. otherwise, wait until it's available.
             if not self.current_tool_name_sent:
+                if current_tool_call is None:
+                    return None
                 function_name: str | None = current_tool_call.get("name")
                 if function_name:
                     self.current_tool_name_sent = True
@@ -367,9 +369,6 @@ class Hermes2ProToolParser(ToolParser):
 
             # now, the nitty-gritty of tool calls
             # now we have the portion to parse as tool call.
-
-            if current_tool_call is None:
-                return None
 
             logger.debug(
                 "Trying to parse current tool call with ID %s", self.current_tool_id
@@ -456,6 +455,19 @@ class Hermes2ProToolParser(ToolParser):
 
             # last case -- we have an update to existing arguments.
             elif cur_arguments and prev_arguments:
+                # make sure delta includes the rest of the unstreamed parts so far
+                if isinstance(delta_text, str):
+                    # Cut out the first function name portion (to prevent issues with args named 'name')
+                    function_name_ending = current_text.find(",") + 1
+                    currrent_text_args = current_text[function_name_ending:].lstrip()
+                    delta_text = currrent_text_args[
+                        currrent_text_args.find(
+                            self.streamed_args_for_tool[self.current_tool_id]
+                        )
+                        + len(
+                            self.streamed_args_for_tool[self.current_tool_id]
+                        ) : currrent_text_args.rfind(delta_text) + len(delta_text)
+                    ]
                 # judge whether the tool_call_portion is a complete JSON
                 try:
                     json.loads(tool_call_portion)
