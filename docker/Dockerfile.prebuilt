@@ -1,0 +1,132 @@
+# Minimal prebuilt Dockerfile for vLLM 0.18.0
+# Installs vLLM from a prebuilt wheel (no source build pipeline).
+# Preserves runtime pieces needed for FlashInfer-backed serving.
+
+# =============================================================================
+# VERSION MANAGEMENT
+# =============================================================================
+ARG CUDA_VERSION=13.0.2
+ARG PYTHON_VERSION=3.12
+ARG FLASHINFER_VERSION=0.6.6
+ARG PYTORCH_CUDA_INDEX_BASE_URL=https://download.pytorch.org/whl
+
+# Base image: CUDA runtime for GPU compatibility + JIT compilation support
+FROM nvidia/cuda:${CUDA_VERSION}-base-ubuntu22.04
+
+ARG CUDA_VERSION
+ARG PYTHON_VERSION
+ARG FLASHINFER_VERSION
+ARG PYTORCH_CUDA_INDEX_BASE_URL
+
+ENV DEBIAN_FRONTEND=noninteractive
+WORKDIR /vllm-workspace
+
+# Derive CUDA version short string for index URLs (e.g. 13.0.2 -> cu130)
+RUN CUDA_VERSION_SHORT="cu$(echo ${CUDA_VERSION} | cut -d. -f1,2 | tr -d '.')" && \
+    echo "export CUDA_VERSION_SHORT=${CUDA_VERSION_SHORT}" >> /etc/environment && \
+    echo "${CUDA_VERSION_SHORT}" > /tmp/cuda_version_short.txt
+
+# =============================================================================
+# SYSTEM DEPENDENCIES
+# =============================================================================
+
+# Install Python, pip, and host C compiler (needed by torch._inductor / Triton)
+RUN apt-get update -y && \
+    apt-get install -y --no-install-recommends \
+        software-properties-common \
+        curl \
+        sudo \
+        python3-pip \
+        gcc \
+        g++ \
+        libibverbs-dev && \
+    add-apt-repository -y ppa:deadsnakes/ppa && \
+    apt-get update -y && \
+    apt-get install -y --no-install-recommends \
+        python${PYTHON_VERSION} \
+        python${PYTHON_VERSION}-dev \
+        python${PYTHON_VERSION}-venv && \
+    rm -rf /var/lib/apt/lists/* && \
+    update-alternatives --install /usr/bin/python3 python3 /usr/bin/python${PYTHON_VERSION} 1 && \
+    update-alternatives --set python3 /usr/bin/python${PYTHON_VERSION} && \
+    ln -sf /usr/bin/python${PYTHON_VERSION}-config /usr/bin/python3-config && \
+    curl -sS https://bootstrap.pypa.io/get-pip.py | python${PYTHON_VERSION} && \
+    python3 --version && python3 -m pip --version
+
+# Set CC explicitly to the installed compiler
+ENV CC=/usr/bin/gcc
+
+# =============================================================================
+# RUNTIME CUDA JIT TOOLCHAIN
+# =============================================================================
+# FlashInfer, DeepGEMM, and EP kernels require nvcc + runtime CUDA libs at
+# runtime for JIT compilation of custom kernels.
+# Also install cuda-cudart-12-9 because the prebuilt vLLM wheel's C extensions
+# were compiled against CUDA 12 and need libcudart.so.12 at runtime.
+RUN CUDA_VERSION_DASH=$(echo $CUDA_VERSION | cut -d. -f1,2 | tr '.' '-') && \
+    apt-get update -y && \
+    apt-get install -y --no-install-recommends \
+        cuda-nvcc-${CUDA_VERSION_DASH} \
+        cuda-cudart-${CUDA_VERSION_DASH} \
+        cuda-nvrtc-${CUDA_VERSION_DASH} \
+        cuda-cuobjdump-${CUDA_VERSION_DASH} \
+        libcurand-dev-${CUDA_VERSION_DASH} \
+        libcublas-${CUDA_VERSION_DASH} \
+        libnccl-dev \
+        cuda-cudart-12-9 && \
+    rm -rf /var/lib/apt/lists/*
+
+# =============================================================================
+# UV + PIP CONFIGURATION
+# =============================================================================
+RUN python3 -m pip install uv
+
+ENV UV_HTTP_TIMEOUT=500
+ENV UV_INDEX_STRATEGY="unsafe-best-match"
+ENV UV_LINK_MODE=copy
+
+# =============================================================================
+# PYTORCH + VLLM INSTALLATION
+# =============================================================================
+# Install vLLM 0.18.0 from prebuilt wheel (wheel-only, no sdist fallback).
+# This also pulls in PyTorch and other dependencies via the wheel's metadata.
+RUN --mount=type=cache,target=/root/.cache/uv \
+    CUDA_VERSION_SHORT=$(cat /tmp/cuda_version_short.txt) && \
+    uv pip install --system --only-binary=:all: vllm==0.18.0 \
+        --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/${CUDA_VERSION_SHORT} \
+        --extra-index-url https://pypi.org/simple
+
+# =============================================================================
+# FLASHINFER RUNTIME ASSETS
+# =============================================================================
+# flashinfer-cubin: pre-compiled kernels (platform-independent, from PyPI)
+# flashinfer-jit-cache: CUDA-specific JIT compilation cache
+RUN --mount=type=cache,target=/root/.cache/uv \
+    CUDA_VERSION_SHORT=$(cat /tmp/cuda_version_short.txt) && \
+    uv pip install --system flashinfer-cubin==${FLASHINFER_VERSION} && \
+    uv pip install --system flashinfer-jit-cache==${FLASHINFER_VERSION} \
+        --extra-index-url https://flashinfer.ai/whl/${CUDA_VERSION_SHORT} && \
+    flashinfer show-config
+
+# =============================================================================
+# RUNTIME LINKER PATHS
+# =============================================================================
+# Ensure torch shared libraries, CUDA compat stubs, and CUDA 12 libs are on linker path
+RUN TORCH_LIB=$(python3 -c "import torch; print(torch.__path__[0] + '/lib')") && \
+    NVIDIA_LIB=$(python3 -c "import nvidia; import os; print(os.path.join(os.path.dirname(nvidia.__file__), 'cu13', 'lib'))" 2>/dev/null || true) && \
+    echo "${TORCH_LIB}" > /etc/ld.so.conf.d/torch.conf && \
+    echo "/usr/local/cuda-12.9/targets/x86_64-linux/lib" > /etc/ld.so.conf.d/cuda12-compat.conf && \
+    echo "/usr/local/cuda-13.0/compat" >> /etc/ld.so.conf.d/cuda-compat.conf && \
+    if [ -n "${NVIDIA_LIB}" ] && [ -d "${NVIDIA_LIB}" ]; then echo "${NVIDIA_LIB}" >> /etc/ld.so.conf.d/nvidia-cu13.conf; fi && \
+    ldconfig
+
+# Include CUDA compat stubs, CUDA 12.9 libs (for prebuilt vLLM .so files), and CUDA 13 libs
+ENV LD_LIBRARY_PATH=/usr/local/cuda-13.0/compat:/usr/local/cuda-12.9/targets/x86_64-linux/lib:/usr/local/cuda/lib64:/usr/local/nvidia/lib64:${LD_LIBRARY_PATH}
+
+# CUDA forward compat (off by default; set '-e VLLM_ENABLE_CUDA_COMPATIBILITY=1' to enable)
+ENV VLLM_ENABLE_CUDA_COMPATIBILITY=0
+
+# =============================================================================
+# DEFAULT CMD
+# =============================================================================
+CMD ["python3", "-c", "import vllm; print('vllm', vllm.__version__)"]
