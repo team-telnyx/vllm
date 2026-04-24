@@ -476,6 +476,8 @@ class ChatCompletionRequest(OpenAIBaseModel):
                 )
                 s_tag_obj = structural_tag.model_dump(by_alias=True)
                 structured_outputs_kwargs["structural_tag"] = json.dumps(s_tag_obj)
+            elif response_format.type == "text":
+                self.structured_outputs = None
 
             # If structured outputs wasn't already enabled,
             # we must enable it for these features to work
