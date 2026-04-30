@@ -5,7 +5,7 @@
 # https://github.com/lm-sys/FastChat/blob/168ccc29d3f7edc50823016105c024fe2282732a/fastchat/protocol/openai_api_protocol.py
 import json
 import time
-from typing import Annotated, Any, ClassVar, Literal
+from typing import Annotated, Any, ClassVar, Literal, cast
 
 from openai.types.chat.chat_completion_audio import (
     ChatCompletionAudio as OpenAIChatCompletionAudio,
@@ -395,7 +395,8 @@ class ChatCompletionRequest(OpenAIBaseModel):
                 continue
             tool_calls = msg.get("tool_calls")
             if tool_calls is not None and not isinstance(tool_calls, list):
-                msg["tool_calls"] = list(tool_calls)
+                msg_map = cast(dict[str, object], cast(object, msg))
+                msg_map["tool_calls"] = list(tool_calls)
         return self
 
     _grammar_from_tool_parser: bool = PrivateAttr(default=False)
@@ -440,7 +441,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
         )
 
     # Default sampling parameters for chat completion requests
-    _DEFAULT_SAMPLING_PARAMS: dict = {
+    _DEFAULT_SAMPLING_PARAMS: dict[str, Any] = {
         "repetition_penalty": 1.0,
         "temperature": 1.0,
         "top_p": 1.0,
@@ -449,7 +450,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
     }
 
     def to_beam_search_params(
-        self, max_tokens: int, default_sampling_params: dict
+        self, max_tokens: int, default_sampling_params: dict[str, Any]
     ) -> BeamSearchParams:
         n = self.n if self.n is not None else 1
         if (temperature := self.temperature) is None:
@@ -469,7 +470,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
     def to_sampling_params(
         self,
         max_tokens: int,
-        default_sampling_params: dict,
+        default_sampling_params: dict[str, Any],
     ) -> SamplingParams:
         # Default parameters
         if (repetition_penalty := self.repetition_penalty) is None:
@@ -520,6 +521,8 @@ class ChatCompletionRequest(OpenAIBaseModel):
                 )
                 s_tag_obj = structural_tag.model_dump(by_alias=True)
                 structured_outputs_kwargs["structural_tag"] = json.dumps(s_tag_obj)
+            elif response_format.type == "text":
+                self.structured_outputs = None
 
             # If structured outputs wasn't already enabled,
             # we must enable it for these features to work
