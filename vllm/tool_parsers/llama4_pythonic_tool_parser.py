@@ -14,6 +14,7 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
 from vllm.entrypoints.openai.engine.protocol import (
     DeltaMessage,
     ExtractedToolCallInformation,
+    ToolCall,
 )
 from vllm.logger import init_logger
 from vllm.tool_parsers.abstract_tool_parser import (
@@ -54,6 +55,7 @@ class Llama4PythonicToolParser(ToolParser):
         tools: list[Tool] | None = None,
     ):
         super().__init__(tokenizer, tools)
+        self.pythonic_to_tool_name: dict[str, str] = {}
 
     # Rename for readability. This is NOT a tool id.
     @property
@@ -64,6 +66,23 @@ class Llama4PythonicToolParser(ToolParser):
     def current_tool_index(self, value: int) -> None:
         self.current_tool_id = value
 
+    def create_pythonic_tool_name_dict(self, request: ChatCompletionRequest) -> None:
+        tools = request.tools or self.tools
+        self.pythonic_to_tool_name = {}
+        for tool in tools:
+            function = getattr(tool, "function", None)
+            name = function.name if function is not None else getattr(tool, "name", None)
+            if name:
+                self.pythonic_to_tool_name[replace_non_letters(name)] = name
+
+    def _handle_single_tool(self, call: ast.Call) -> ToolCall:
+        tool_call = handle_single_tool(call)
+        function_name = tool_call.function.name
+        tool_call.function.name = self.pythonic_to_tool_name.get(
+            function_name, function_name
+        )
+        return tool_call
+
     def extract_tool_calls(
         self, model_output: str, request: ChatCompletionRequest
     ) -> ExtractedToolCallInformation:
@@ -71,11 +90,21 @@ class Llama4PythonicToolParser(ToolParser):
         Extract the tool calls from a complete model response.
         """
 
+        self.create_pythonic_tool_name_dict(request)
+
         # remove <|python_start|> and <|python_end|>
         # as Llama 4 model sometime will output those tokens
         if model_output.startswith("<|python_start|>"):
             model_output = model_output[len("<|python_start|>") :]
             model_output = model_output.replace("<|python_end|>", "")
+        original_model_output = model_output
+        if not model_output.startswith("["):
+            return ExtractedToolCallInformation(
+                tools_called=False, tool_calls=[], content=model_output
+            )
+        model_output = sanitize_function_names(
+            model_output, self.pythonic_to_tool_name
+        )
 
         is_tool_call_pattern = False
         try:
@@ -93,7 +122,7 @@ class Llama4PythonicToolParser(ToolParser):
 
         if not is_tool_call_pattern:
             return ExtractedToolCallInformation(
-                tools_called=False, tool_calls=[], content=model_output
+                tools_called=False, tool_calls=[], content=original_model_output
             )
 
         try:
@@ -105,8 +134,9 @@ class Llama4PythonicToolParser(ToolParser):
                 return ExtractedToolCallInformation(
                     tools_called=True,
                     tool_calls=[
-                        handle_single_tool(e)  # type: ignore
+                        self._handle_single_tool(e)
                         for e in parsed.elts
+                        if isinstance(e, ast.Call)
                     ],
                     content=None,
                 )
@@ -116,7 +146,7 @@ class Llama4PythonicToolParser(ToolParser):
             logger.exception("Error in extracting tool call from response.")
             # Treat as regular text
             return ExtractedToolCallInformation(
-                tools_called=False, tool_calls=[], content=model_output
+                tools_called=False, tool_calls=[], content=original_model_output
             )
 
     def extract_tool_calls_streaming(
@@ -129,6 +159,10 @@ class Llama4PythonicToolParser(ToolParser):
         delta_token_ids: Sequence[int],
         request: ChatCompletionRequest,
     ) -> DeltaMessage | None:
+        self.create_pythonic_tool_name_dict(request)
+        current_text = _drop_text_before_tool_list(current_text)
+        previous_text = _drop_text_before_tool_list(previous_text)
+
         if not current_text.startswith("[") and not current_text.startswith(
             "<|python_start|>"
         ):
@@ -144,6 +178,9 @@ class Llama4PythonicToolParser(ToolParser):
             if valid_and_added_text is None:
                 return None
             valid_text, added_text = valid_and_added_text
+            valid_text = sanitize_function_names(
+                valid_text, self.pythonic_to_tool_name
+            )
 
             module = ast.parse(valid_text)
             parsed = getattr(module.body[0], "value", None)
@@ -152,8 +189,9 @@ class Llama4PythonicToolParser(ToolParser):
             ):
                 raise UnexpectedAstError("Tool output must be a list of function calls")
             tool_calls = [
-                handle_single_tool(e)  # type: ignore
+                self._handle_single_tool(e)
                 for e in parsed.elts
+                if isinstance(e, ast.Call)
             ]
 
             tool_deltas = []
@@ -212,3 +250,27 @@ class Llama4PythonicToolParser(ToolParser):
                 "Skipping chunk as a result of tool streaming extraction error"
             )
             return None
+
+
+def _drop_text_before_tool_list(text: str) -> str:
+    tool_start_index = text.find("\n\n[")
+    if tool_start_index < 0:
+        return text
+    return text[tool_start_index + 2 :]
+
+
+def replace_non_letters(text: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9]", "_", text)
+
+
+def sanitize_function_names(text: str, pythonic_to_tool_name: dict[str, str]) -> str:
+    for pythonic_name, tool_name in sorted(
+        pythonic_to_tool_name.items(), key=lambda item: len(item[1]), reverse=True
+    ):
+        pattern = r"([\[,\s]*)" + re.escape(tool_name) + r"(?=\()"
+        text = re.sub(
+            pattern,
+            lambda match, name=pythonic_name: match.group(1) + name,
+            text,
+        )
+    return text
