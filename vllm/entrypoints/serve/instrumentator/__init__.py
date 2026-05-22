@@ -15,6 +15,10 @@ def register_instrumentator_api_routers(app: FastAPI):
 
     app.include_router(health_router)
 
+    from .info import router as info_router
+
+    app.include_router(info_router)
+
     from .metrics import attach_router as metrics_attach_router
 
     metrics_attach_router(app)
