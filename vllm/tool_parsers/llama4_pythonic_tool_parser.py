@@ -53,6 +53,8 @@ class Llama4PythonicToolParser(ToolParser):
         tokenizer: PreTrainedTokenizerBase,
         tools: list[Tool] | None = None,
     ):
+        self.pythonic_to_tool_name: dict[str, str] = {}
+        self.pythonic_to_tool_name_dict_created = False
         super().__init__(tokenizer, tools)
 
     # Rename for readability. This is NOT a tool id.
@@ -63,6 +65,12 @@ class Llama4PythonicToolParser(ToolParser):
     @current_tool_index.setter
     def current_tool_index(self, value: int) -> None:
         self.current_tool_id = value
+
+    def create_pythonic_tool_name_dict(self, request: ChatCompletionRequest) -> None:
+        self.pythonic_to_tool_name = {
+            replace_non_letters(tool_param.function.name): tool_param.function.name
+            for tool_param in request.tools or []
+        }
 
     def extract_tool_calls(
         self, model_output: str, request: ChatCompletionRequest
@@ -77,11 +85,14 @@ class Llama4PythonicToolParser(ToolParser):
             model_output = model_output[len("<|python_start|>") :]
             model_output = model_output.replace("<|python_end|>", "")
 
+        self.create_pythonic_tool_name_dict(request)
+        parse_text = sanitize_function_names(model_output)
+
         is_tool_call_pattern = False
         try:
             is_tool_call_pattern = (
                 self.TOOL_CALL_REGEX.match(
-                    model_output, timeout=envs.VLLM_TOOL_PARSE_REGEX_TIMEOUT_SECONDS
+                    parse_text, timeout=envs.VLLM_TOOL_PARSE_REGEX_TIMEOUT_SECONDS
                 )
                 is not None
             )
@@ -97,7 +108,7 @@ class Llama4PythonicToolParser(ToolParser):
             )
 
         try:
-            module = ast.parse(model_output)
+            module = ast.parse(parse_text)
             parsed = getattr(module.body[0], "value", None)
             if isinstance(parsed, ast.List) and all(
                 isinstance(e, ast.Call) for e in parsed.elts
@@ -105,7 +116,7 @@ class Llama4PythonicToolParser(ToolParser):
                 return ExtractedToolCallInformation(
                     tools_called=True,
                     tool_calls=[
-                        handle_single_tool(e)  # type: ignore
+                        _handle_single_tool(e, self.pythonic_to_tool_name)  # type: ignore
                         for e in parsed.elts
                     ],
                     content=None,
@@ -129,6 +140,20 @@ class Llama4PythonicToolParser(ToolParser):
         delta_token_ids: Sequence[int],
         request: ChatCompletionRequest,
     ) -> DeltaMessage | None:
+        if not self.pythonic_to_tool_name_dict_created:
+            self.create_pythonic_tool_name_dict(request)
+            self.pythonic_to_tool_name_dict_created = True
+
+        tool_start_index = current_text.find("\n\n[")
+        if tool_start_index < 0:
+            tool_start_index = -2
+        current_text = current_text[tool_start_index + 2 :]
+
+        tool_start_index = previous_text.find("\n\n[")
+        if tool_start_index < 0:
+            tool_start_index = -2
+        previous_text = previous_text[tool_start_index + 2 :]
+
         if not current_text.startswith("[") and not current_text.startswith(
             "<|python_start|>"
         ):
@@ -145,6 +170,8 @@ class Llama4PythonicToolParser(ToolParser):
                 return None
             valid_text, added_text = valid_and_added_text
 
+            valid_text = sanitize_function_names(valid_text)
+
             module = ast.parse(valid_text)
             parsed = getattr(module.body[0], "value", None)
             if not isinstance(parsed, ast.List) or not all(
@@ -152,7 +179,7 @@ class Llama4PythonicToolParser(ToolParser):
             ):
                 raise UnexpectedAstError("Tool output must be a list of function calls")
             tool_calls = [
-                handle_single_tool(e)  # type: ignore
+                _handle_single_tool(e, self.pythonic_to_tool_name)  # type: ignore
                 for e in parsed.elts
             ]
 
@@ -212,3 +239,27 @@ class Llama4PythonicToolParser(ToolParser):
                 "Skipping chunk as a result of tool streaming extraction error"
             )
             return None
+
+
+def _handle_single_tool(call: ast.Call, pythonic_to_tool_name: dict[str, str]):
+    tool_call = handle_single_tool(call)
+    tool_call.function.name = pythonic_to_tool_name.get(
+        tool_call.function.name, tool_call.function.name
+    )
+    return tool_call
+
+
+def replace_non_letters(text: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9]", "_", text)
+
+
+def fix_boolean_case(text: str) -> str:
+    return re.sub(r"\b(true|false)\b", lambda m: m.group(1).capitalize(), text)
+
+
+def sanitize_function_names(text: str) -> str:
+    pattern = r"([\[,]\s*)([^(]+)\("
+    result = re.sub(
+        pattern, lambda m: m.group(1) + replace_non_letters(m.group(2)) + "(", text
+    )
+    return result
